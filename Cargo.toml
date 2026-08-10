@@ -1,0 +1,19 @@
+[workspace]
+members = [ "rs/v-m-io-types" ]
+resolver = "3"
+
+[workspace.package]
+authors = ["Void Merge, LLC"]
+version = "0.0.1"
+edition = "2024"
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[workspace.dependencies]
+bincode-next = "3.1.1"
+bytes = "1.12.1"
+serde = "1.0.229"

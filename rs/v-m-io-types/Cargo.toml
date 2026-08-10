@@ -1,0 +1,17 @@
+[package]
+name = "v-m-io-types"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+description = "v-m.io types"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/v-m-io-types"
+repository = "https://github.com/voidmerge/v-m.io"
+keywords = [ "p2p", "verify", "verifiable" ]
+categories = [ "database", "database-implementations", "network-programming", "web-programming" ]
+
+[dependencies]
+bincode-next = { workspace = true, features = ["serde"] }
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
