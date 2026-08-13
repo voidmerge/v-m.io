@@ -1,5 +1,5 @@
 [package]
-name = "v-m-io-types"
+name = "v-m-io-back"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -12,9 +12,9 @@ keywords = [ "p2p", "verify", "verifiable" ]
 categories = [ "database", "database-implementations", "network-programming", "web-programming" ]
 
 [dependencies]
-bincode-next = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["full"] }
 hyper = { workspace = true, features = ["server"] }
 hyper-util = { workspace = true, features = ["server", "server-auto", "tokio"] }
 http-body-util = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["full"] }
+lru = { workspace = true }
+mlua = { workspace = true, features = ["luajit"] }

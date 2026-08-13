@@ -2,19 +2,9 @@
 
 //! v-m.io types
 
+/// Boxed Future.
+pub type BoxFut<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a + Send>>;
+
 pub mod api;
-
-/// A test function.
-pub fn test() {
-    println!("yo");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanity() {
-        test();
-    }
-}
+pub mod srv;

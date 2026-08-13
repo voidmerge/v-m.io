@@ -14,8 +14,8 @@ const CONFIG: bincode_next::config::Configuration =
 // - only add new variants to the end
 
 /// Main API codec enum.
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
-pub enum VmIoApi {
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Api {
     /// We were unable to parse the request or response.
     Unknown,
 
@@ -47,7 +47,7 @@ pub enum VmIoApi {
     },
 }
 
-impl VmIoApi {
+impl Api {
     /// Encode to bytes.
     pub fn encode(&self) -> Result<Vec<u8>> {
         bincode_next::serde::encode_to_vec(self, CONFIG)
@@ -55,13 +55,13 @@ impl VmIoApi {
     }
 
     /// Decode from bytes.
-    pub fn decode(slice: &[u8]) -> Self {
+    pub fn decode(slice: &[u8]) -> Result<Self> {
         if let Ok((out, _)) =
             bincode_next::serde::decode_from_slice(slice, CONFIG)
         {
-            out
+            Ok(out)
         } else {
-            VmIoApi::Unknown
+            Ok(Self::Unknown)
         }
     }
 }
@@ -72,13 +72,13 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let enc = VmIoApi::RateResponse {
+        let enc = Api::RateResponse {
             now: 3.14159,
             cur: 42.0,
         }
         .encode()
         .unwrap();
 
-        println!("{:?}", VmIoApi::decode(&enc));
+        println!("{:?}", Api::decode(&enc));
     }
 }

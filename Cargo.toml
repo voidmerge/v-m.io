@@ -1,5 +1,9 @@
 [workspace]
-members = [ "rs/v-m-io-types" ]
+members = [
+  "rs/v-m-io-back",
+  "rs/v-m-io-db",
+  "rs/v-m-io-types",
+]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +18,20 @@ panic = "abort"
 panic = "abort"
 
 [workspace.dependencies]
+aegis = "0.9.15"
 bincode-next = "3.1.1"
-bytes = "1.12.1"
+hex = "0.4.3"
+hkdf = "0.13.0"
+http-body-util = "0.1.4"
+hyper = "1.11.0"
+hyper-util = "0.1.20"
+turso = "0.7.2"
+lru = "0.18"
+mlua = "0.12"
+rand = "0.10.2"
+rusqlite = "0.40.2"
 serde = "1.0.229"
+sha2 = "0.11"
+thiserror = "2"
+tokio = "1.53.1"
+zeroize = "1.9.0"

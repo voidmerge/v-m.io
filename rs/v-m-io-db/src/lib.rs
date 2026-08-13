@@ -1,0 +1,180 @@
+#![deny(missing_docs)]
+//! v-m.io all service runtime database
+
+use sha2::Digest;
+use std::io::Result;
+
+mod blob;
+mod sql;
+
+/// Database entry.
+pub struct VmIoDbEntry {
+    /// entry class identifier
+    pub class: String,
+
+    /// entry key identifier
+    pub key: String,
+
+    /// entry created at timestamp in microseconds
+    pub modified_at_micros: i64,
+
+    /// if specified, entry will be pruned after this timestamp in microseconds
+    pub expires_at_micros: Option<i64>,
+
+    /// optional metadata associated with entry
+    pub metadata: Option<Vec<u8>>,
+
+    /// chunk count for file data (0 for no file)
+    pub chunk_count: i64,
+}
+
+/// Database list result.
+pub struct VmIoDbListResult {
+    /// entry class identifier
+    pub class: String,
+
+    /// entry key identifier
+    pub key: String,
+}
+
+/// v-m.io all service runtime database
+pub struct VmIoDb {
+    root_dir: std::path::PathBuf,
+    sql: sql::Sql,
+    encryption_key: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl VmIoDb {
+    /// Construct a new database.
+    pub async fn new<P: Into<std::path::PathBuf>>(
+        root_dir: P,
+        encryption_key: zeroize::Zeroizing<[u8; 32]>,
+    ) -> Result<Self> {
+        let root_dir = root_dir.into();
+        tokio::fs::create_dir_all(&root_dir).await?;
+
+        let mut sql_path = root_dir.clone();
+        sql_path.push("db.sqlite");
+
+        let sql = sql::Sql::new(sql_path, encryption_key.clone()).await?;
+
+        Ok(Self {
+            root_dir,
+            sql,
+            encryption_key: encryption_key.into(),
+        })
+    }
+
+    /// Upsert an entry.
+    pub async fn upsert(
+        &self,
+        class: String,
+        key: String,
+        modified_at_micros: i64,
+        expires_at_micros: Option<i64>,
+        metadata: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.sql
+            .upsert(class, key, modified_at_micros, expires_at_micros, metadata)
+            .await
+    }
+
+    /// Upsert a chunk.
+    pub async fn upsert_chunk(
+        &self,
+        class: String,
+        key: String,
+        idx: i64,
+        mut data: Vec<u8>,
+        is_final: bool,
+    ) -> Result<()> {
+        if !is_final && data.len() != 1024 * 1024 * 5 {
+            return Err(std::io::Error::other(
+                "non-final chunks must be 5 MiB",
+            ));
+        } else if is_final && data.len() > 1024 * 1024 * 5 {
+            return Err(std::io::Error::other(
+                "final chunks cannot be > 5 MiB",
+            ));
+        }
+
+        let hash: [u8; 32] = sha2::Sha256::digest(&data).into();
+
+        let path = blob::gen_path(&self.root_dir, &class, &key, idx, &hash);
+        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+
+        let blob::EncryptResult { nonce, tag } = blob::encrypt_chunk(
+            &class,
+            &key,
+            idx,
+            &mut data[..],
+            &hash,
+            &self.encryption_key,
+            is_final,
+        )?;
+
+        self.sql
+            .upsert_chunk(
+                class,
+                key,
+                idx,
+                hash,
+                nonce,
+                tag,
+                data.len() as i64,
+                is_final,
+            )
+            .await?;
+
+        tokio::fs::write(path, &data).await?;
+
+        Ok(())
+    }
+
+    /// Get an entry.
+    pub async fn get(
+        &self,
+        class: String,
+        key: String,
+    ) -> Result<Option<VmIoDbEntry>> {
+        self.sql.get(class, key).await
+    }
+
+    /// Get an entry file chunk.
+    pub async fn get_chunk(
+        &self,
+        class: String,
+        key: String,
+        idx: i64,
+        is_final: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        // TODO get the aegis256 data from sql
+        // TODO read the hashed chunk from disk
+        // TODO decrypt_in_place read buffer
+        // TODO return it
+        todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn make_db() -> Result<(VmIoDb, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let db = VmIoDb::new(dir.path(), [0xdb; 32].into()).await?;
+        Ok((db, dir))
+    }
+
+    #[tokio::test]
+    async fn sanity() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "k".into(), 42, None, None)
+            .await
+            .unwrap();
+
+        let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
+        assert_eq!(42, e.modified_at_micros);
+    }
+}
