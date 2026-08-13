@@ -148,6 +148,15 @@ impl VmIoDb {
         idx: i64,
         is_final: bool,
     ) -> Result<Option<Vec<u8>>> {
+        let chunk = match self.sql.get_chunk(class, key, idx).await? {
+            None => return Ok(None),
+            Some(chunk) => chunk,
+        };
+
+        if is_final != chunk.is_final {
+            return Err(std::io::Error::other("chunk finality mismatch"));
+        }
+
         // TODO get the aegis256 data from sql
         // TODO read the hashed chunk from disk
         // TODO decrypt_in_place read buffer
@@ -176,5 +185,19 @@ mod tests {
 
         let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
         assert_eq!(42, e.modified_at_micros);
+        assert_eq!(0, e.chunk_count);
+
+        db.upsert_chunk("c".into(), "k".into(), 0, b"hello".into(), true)
+            .await
+            .unwrap();
+
+        let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
+        assert_eq!(1, e.chunk_count);
+
+        let c = db
+            .get_chunk("c".into(), "k".into(), 0, true)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

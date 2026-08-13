@@ -10,8 +10,10 @@ PRAGMA foreign_keys = ON;
 
 const SCHEMA: &str = include_str!("sql/schema.sql");
 const UPSERT: &str = include_str!("sql/upsert.sql");
+const UPSERT_CHUNK: &str = include_str!("sql/upsert_chunk.sql");
 const GET_ENTRY: &str = include_str!("sql/get_entry.sql");
 const GET_CHUNK_COUNT: &str = include_str!("sql/get_chunk_count.sql");
+const GET_CHUNK: &str = include_str!("sql/get_chunk.sql");
 
 pub fn sqlite_key(
     secret: &zeroize::Zeroizing<[u8; 32]>,
@@ -164,9 +166,24 @@ impl Sql {
         nonce: [u8; 32],
         tag: [u8; 32],
         size: i64,
-        last: bool,
+        is_final: bool,
     ) -> Result<()> {
-        todo!()
+        let c_write = self.c_write.clone();
+        tokio::task::spawn_blocking(move || {
+            c_write
+                .lock()
+                .unwrap()
+                .execute(
+                    UPSERT_CHUNK,
+                    rusqlite::params![
+                        class, key, idx, hash, nonce, tag, size, is_final,
+                    ],
+                )
+                .map_err(std::io::Error::other)?;
+            Ok(())
+        })
+        .await
+        .expect("blocking thread error")
     }
 
     /// Remove an entry (and all chunk references).
@@ -227,7 +244,31 @@ impl Sql {
         key: String,
         idx: i64,
     ) -> Result<Option<Chunk>> {
-        todo!()
+        let c_read_pool = self.c_read_pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c_read = c_read_pool.get();
+            let tx = c_read.transaction().map_err(std::io::Error::other)?;
+
+            match tx.query_one(
+                GET_CHUNK,
+                rusqlite::params![class, key, idx],
+                |row| {
+                    Ok(Chunk {
+                        hash: row.get(0)?,
+                        nonce: row.get(1)?,
+                        tag: row.get(2)?,
+                        size: row.get(3)?,
+                        is_final: row.get(4)?,
+                    })
+                },
+            ) {
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(std::io::Error::other(err)),
+                Ok(chunk) => Ok(Some(chunk)),
+            }
+        })
+        .await
+        .expect("blocking thread error")
     }
 
     /// List entries.
@@ -287,7 +328,7 @@ pub struct Chunk {
     pub size: i64,
 
     /// is this the last file chunk?
-    pub last: bool,
+    pub is_final: bool,
 }
 
 struct RingPool<T> {

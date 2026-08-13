@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS entry_file_chunks (
   nonce BLOB NOT NULL,
   tag BLOB NOT NULL,
   size INT NOT NULL,
-  last BOOLEAN NOT NULL DEFAULT FALSE,
+  is_final BOOLEAN NOT NULL DEFAULT FALSE,
 
   PRIMARY KEY (class, key, idx),
   FOREIGN KEY (class, key) REFERENCES entries (class, key)
