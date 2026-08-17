@@ -79,3 +79,24 @@ pub fn encrypt_chunk(
 
     Ok(EncryptResult { nonce, tag })
 }
+
+pub fn decrypt_chunk(
+    class: &str,
+    key: &str,
+    idx: i64,
+    data: &mut [u8],
+    hash: &[u8; 32],
+    encryption_key: &[u8; 32],
+    is_final: bool,
+    nonce: &[u8; 32],
+    tag: &[u8; 32],
+) -> Result<()> {
+    let sub_key = derive_sub_key(idx, hash, encryption_key);
+
+    let adata = make_adata(class, key, idx, hash, is_final);
+
+    let dec = <aegis::aegis256::Aegis256<32>>::new(&sub_key, nonce);
+
+    dec.decrypt_in_place(data, tag, &adata)
+        .map_err(std::io::Error::other)
+}

@@ -189,8 +189,52 @@ impl Sql {
     /// Remove an entry (and all chunk references).
     ///
     /// Returns a list of deleted chunks so the file stores can be removed.
-    pub async fn rm(&self, class: &str, key: &str) -> Result<Vec<Chunk>> {
-        todo!()
+    pub async fn rm(&self, class: String, key: String) -> Result<Vec<Chunk>> {
+        let c_write = self.c_write.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c_write = c_write.lock().unwrap();
+            let tx = c_write
+                .transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Exclusive,
+                )
+                .map_err(std::io::Error::other)?;
+            let mut out: Vec<Chunk> = Vec::new();
+            for chunk in tx
+                .prepare(
+                    "
+SELECT idx, hash, nonce, tag, size, is_final
+FROM entry_file_chunks
+WHERE class = ?1 AND key = ?2;
+            ",
+                )
+                .map_err(std::io::Error::other)?
+                .query_map(rusqlite::params![&class, &key], |row| {
+                    Ok(Chunk {
+                        idx: row.get(0)?,
+                        hash: row.get(1)?,
+                        nonce: row.get(2)?,
+                        tag: row.get(3)?,
+                        size: row.get(4)?,
+                        is_final: row.get(5)?,
+                    })
+                })
+                .map_err(std::io::Error::other)?
+            {
+                out.push(chunk.map_err(std::io::Error::other)?);
+            }
+            tx.execute(
+                "
+DELETE FROM entries
+WHERE class = ?1 AND key = ?2;
+            ",
+                rusqlite::params![class, key],
+            )
+            .map_err(std::io::Error::other)?;
+            tx.commit().map_err(std::io::Error::other)?;
+            Ok(out)
+        })
+        .await
+        .expect("blocking thread error")
     }
 
     /// Get an entry.
@@ -254,11 +298,12 @@ impl Sql {
                 rusqlite::params![class, key, idx],
                 |row| {
                     Ok(Chunk {
-                        hash: row.get(0)?,
-                        nonce: row.get(1)?,
-                        tag: row.get(2)?,
-                        size: row.get(3)?,
-                        is_final: row.get(4)?,
+                        idx: row.get(0)?,
+                        hash: row.get(1)?,
+                        nonce: row.get(2)?,
+                        tag: row.get(3)?,
+                        size: row.get(4)?,
+                        is_final: row.get(5)?,
                     })
                 },
             ) {
@@ -315,6 +360,9 @@ pub enum ListSort {
 
 /// A database entry file chunk.
 pub struct Chunk {
+    /// chunk index
+    pub idx: i64,
+
     /// sha256 hash of chunk content
     pub hash: [u8; 32],
 

@@ -1,4 +1,5 @@
 SELECT
+  idx,
   hash,
   nonce,
   tag,
