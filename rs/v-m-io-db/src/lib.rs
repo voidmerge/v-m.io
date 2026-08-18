@@ -89,32 +89,41 @@ const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// behind one long delete.
 const PRUNE_BATCH: i64 = 256;
 
+/// Drain the backlog of entries that have already expired, a batch at a
+/// time, so a large number of simultaneous expirations does not take
+/// PRUNE_INTERVAL per batch to clear.
+///
+/// Split out of [prune_task] so tests can drive a pass on demand instead of
+/// waiting on its sleep loop.
+async fn prune_backlog(
+    root_dir: &std::path::Path,
+    sql: &sql::Sql,
+) -> Result<()> {
+    while let Ok(now_micros) = unix_micros() {
+        let (count, blob_ids) =
+            sql.prune_expired(now_micros, PRUNE_BATCH).await?;
+
+        for blob_id in blob_ids {
+            // best effort - these are unreferenced now, so anything we fail
+            // to remove here is collected by the cleanup task
+            let _ =
+                tokio::fs::remove_file(blob::id_path(root_dir, &blob_id))
+                    .await;
+        }
+
+        if count < PRUNE_BATCH as usize {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 /// Periodically remove entries that have passed their expiration.
 async fn prune_task(root_dir: std::path::PathBuf, sql: Arc<sql::Sql>) {
     loop {
-        // drain the backlog a batch at a time before waiting for the next
-        // pass, so a large number of simultaneous expirations does not take
-        // PRUNE_INTERVAL per batch to clear
-        while let Ok(now_micros) = unix_micros() {
-            let (count, blob_ids) =
-                match sql.prune_expired(now_micros, PRUNE_BATCH).await {
-                    // best effort - retry on the next pass
-                    Err(_) => break,
-                    Ok(pruned) => pruned,
-                };
-
-            for blob_id in blob_ids {
-                // best effort - these are unreferenced now, so anything we
-                // fail to remove here is collected by the cleanup task
-                let _ =
-                    tokio::fs::remove_file(blob::id_path(&root_dir, &blob_id))
-                        .await;
-            }
-
-            if count < PRUNE_BATCH as usize {
-                break;
-            }
-        }
+        // best effort - errors are retried on the next pass
+        let _ = prune_backlog(&root_dir, &sql).await;
 
         tokio::time::sleep(PRUNE_INTERVAL).await;
     }
@@ -769,5 +778,398 @@ mod tests {
             vec!["c", "d"],
             l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_validates_field_lengths() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        assert!(
+            db.upsert("c".repeat(257), "k".into(), 1, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.upsert("c".into(), "k".repeat(1025), 1, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.upsert(
+                "c".into(),
+                "k".into(),
+                1,
+                None,
+                Some(vec![0; 4097]),
+            )
+            .await
+            .is_err()
+        );
+
+        // nothing should have been written by the failed calls above
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert!(l.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_chunk_validates_size() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+
+        // non-final chunks must be exactly 5 MiB
+        assert!(
+            db.upsert_chunk("c".into(), "k".into(), 0, vec![0; 10], false)
+                .await
+                .is_err()
+        );
+
+        // final chunks may not exceed 5 MiB
+        assert!(
+            db.upsert_chunk(
+                "c".into(),
+                "k".into(),
+                0,
+                vec![0; 1024 * 1024 * 5 + 1],
+                true,
+            )
+            .await
+            .is_err()
+        );
+
+        // exactly 5 MiB is allowed for a final chunk
+        db.upsert_chunk(
+            "c".into(),
+            "k".into(),
+            0,
+            vec![0; 1024 * 1024 * 5],
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_missing_entry() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        assert!(db.get("c".into(), "missing".into()).await.unwrap().is_none());
+
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+        assert!(db.get("other".into(), "k".into()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_chunk_returns_none_for_missing_chunk() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_chunk("c".into(), "k".into(), 0, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chunk_errors_on_finality_mismatch() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+        db.upsert_chunk("c".into(), "k".into(), 0, b"hello".to_vec(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_chunk("c".into(), "k".into(), 0, false).await.is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_file_round_trips() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+
+        let first = vec![7u8; 1024 * 1024 * 5];
+        db.upsert_chunk("c".into(), "k".into(), 0, first.clone(), false)
+            .await
+            .unwrap();
+        db.upsert_chunk("c".into(), "k".into(), 1, b"tail".to_vec(), true)
+            .await
+            .unwrap();
+
+        let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
+        assert_eq!(2, e.chunk_count);
+
+        let c0 = db
+            .get_chunk("c".into(), "k".into(), 0, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, c0);
+
+        let c1 = db
+            .get_chunk("c".into(), "k".into(), 1, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b"tail", c1.as_slice());
+    }
+
+    /// Path of the blob file backing a given (final) chunk, computed the same
+    /// way [VmIoDb::upsert_chunk] does, so tests can assert on disk state
+    /// without the db exposing blob ids as part of its public api.
+    fn chunk_blob_path(
+        db: &VmIoDb,
+        class: &str,
+        key: &str,
+        idx: i64,
+        data: &[u8],
+        is_final: bool,
+    ) -> std::path::PathBuf {
+        let hash: [u8; 32] = sha2::Sha256::digest(data).into();
+        let id = blob::gen_id(
+            &blob::ChunkId { class, key, idx, hash: &hash, is_final },
+            &db.blob_key,
+        );
+        blob::id_path(&db.root_dir, &id)
+    }
+
+    #[tokio::test]
+    async fn rm_deletes_entry_and_blob_files() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+        db.upsert_chunk("c".into(), "k".into(), 0, b"hello".to_vec(), true)
+            .await
+            .unwrap();
+
+        let path = chunk_blob_path(&db, "c", "k", 0, b"hello", true);
+        assert!(tokio::fs::metadata(&path).await.is_ok());
+
+        db.rm("c".into(), "k".into()).await.unwrap();
+
+        assert!(db.get("c".into(), "k".into()).await.unwrap().is_none());
+        assert!(tokio::fs::metadata(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn upsert_chunk_replaces_blob_on_content_change() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+        db.upsert_chunk("c".into(), "k".into(), 0, b"hello".to_vec(), true)
+            .await
+            .unwrap();
+        let old_path = chunk_blob_path(&db, "c", "k", 0, b"hello", true);
+        assert!(tokio::fs::metadata(&old_path).await.is_ok());
+
+        // rewriting identical content is a no-op: same blob path, still
+        // there, and the call itself must not fail
+        db.upsert_chunk("c".into(), "k".into(), 0, b"hello".to_vec(), true)
+            .await
+            .unwrap();
+        assert!(tokio::fs::metadata(&old_path).await.is_ok());
+
+        // rewriting with different content moves the chunk to a new blob
+        // and cleans up the one it no longer references
+        db.upsert_chunk("c".into(), "k".into(), 0, b"world!".to_vec(), true)
+            .await
+            .unwrap();
+        let new_path = chunk_blob_path(&db, "c", "k", 0, b"world!", true);
+        assert_ne!(old_path, new_path);
+        assert!(tokio::fs::metadata(&old_path).await.is_err());
+        assert!(tokio::fs::metadata(&new_path).await.is_ok());
+
+        let c = db
+            .get_chunk("c".into(), "k".into(), 0, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b"world!", c.as_slice());
+    }
+
+    #[tokio::test]
+    async fn prune_backlog_removes_only_expired_entries() {
+        let (db, _dir) = make_db().await.unwrap();
+        let now = unix_micros().unwrap();
+
+        // insert not-yet-expired, so the real prune_task spawned alongside
+        // this db (which the test never controls the timing of) cannot race
+        // the entry out from under upsert_chunk's foreign key before the
+        // chunk is attached
+        db.upsert("c".into(), "expired".into(), 1, None, None)
+            .await
+            .unwrap();
+        db.upsert_chunk(
+            "c".into(),
+            "expired".into(),
+            0,
+            b"old".to_vec(),
+            true,
+        )
+        .await
+        .unwrap();
+        let blob_path = chunk_blob_path(&db, "c", "expired", 0, b"old", true);
+        assert!(tokio::fs::metadata(&blob_path).await.is_ok());
+
+        // now mark it expired
+        db.upsert(
+            "c".into(),
+            "expired".into(),
+            4,
+            Some(now - 1_000_000),
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.upsert(
+            "c".into(),
+            "future".into(),
+            2,
+            Some(now + 1_000_000_000),
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert("c".into(), "forever".into(), 3, None, None)
+            .await
+            .unwrap();
+
+        prune_backlog(&db.root_dir, &db.sql).await.unwrap();
+
+        assert!(
+            db.get("c".into(), "expired".into()).await.unwrap().is_none()
+        );
+        assert!(
+            db.get("c".into(), "future".into()).await.unwrap().is_some()
+        );
+        assert!(
+            db.get("c".into(), "forever".into()).await.unwrap().is_some()
+        );
+
+        // prune_backlog removes the blob file directly; the now-empty shard
+        // directories it leaves behind are the disk cleanup task's job
+        assert!(tokio::fs::metadata(&blob_path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn prune_backlog_drains_a_backlog_larger_than_one_batch() {
+        let (db, _dir) = make_db().await.unwrap();
+        let now = unix_micros().unwrap();
+
+        let total = PRUNE_BATCH as usize + 44;
+        for i in 0..total {
+            db.upsert(
+                "c".into(),
+                format!("k{i}"),
+                i as i64 + 1,
+                Some(now - 1_000_000),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // a single call must fully drain the backlog, not just one batch
+        prune_backlog(&db.root_dir, &db.sql).await.unwrap();
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert!(l.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_dir_removes_stale_unreferenced_blobs_and_empty_shards() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        // a real, referenced chunk - must survive cleanup no matter how
+        // stale it looks, since a sql row still references it
+        db.upsert("c".into(), "k".into(), 1, None, None)
+            .await
+            .unwrap();
+        db.upsert_chunk("c".into(), "k".into(), 0, b"kept".to_vec(), true)
+            .await
+            .unwrap();
+        let kept_path = chunk_blob_path(&db, "c", "k", 0, b"kept", true);
+
+        // an orphan blob with no sql row referencing it, as if a crash had
+        // interrupted upsert_chunk after the file write but before commit
+        let orphan_path = blob::id_path(&db.root_dir, &[0xAA; 32]);
+        blob::write(&orphan_path, b"orphan").await.unwrap();
+
+        assert!(tokio::fs::metadata(&kept_path).await.is_ok());
+        assert!(tokio::fs::metadata(&orphan_path).await.is_ok());
+
+        // a cutoff in the future makes everything just written look past
+        // its grace period, without having to sleep out CLEANUP_GRACE
+        let cutoff = std::time::SystemTime::now()
+            + std::time::Duration::from_secs(5);
+        cleanup_dir(&db.root_dir, &db.sql, db.root_dir.clone(), 0, cutoff)
+            .await
+            .unwrap();
+
+        assert!(tokio::fs::metadata(&kept_path).await.is_ok());
+        assert!(tokio::fs::metadata(&orphan_path).await.is_err());
+
+        // the shard directories that only ever held the orphan should have
+        // been pruned along with it once they were left empty
+        assert!(
+            tokio::fs::metadata(orphan_path.parent().unwrap())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_dir_respects_grace_period_for_fresh_orphans() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        let orphan_path = blob::id_path(&db.root_dir, &[0xBB; 32]);
+        blob::write(&orphan_path, b"orphan").await.unwrap();
+
+        // a cutoff well in the past means nothing just written qualifies as
+        // stale yet, mirroring a real pass that runs before CLEANUP_GRACE
+        // has elapsed
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(3600);
+        cleanup_dir(&db.root_dir, &db.sql, db.root_dir.clone(), 0, cutoff)
+            .await
+            .unwrap();
+
+        assert!(tokio::fs::metadata(&orphan_path).await.is_ok());
     }
 }
