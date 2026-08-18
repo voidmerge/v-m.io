@@ -28,13 +28,37 @@ pub struct VmIoDbEntry {
     pub chunk_count: i64,
 }
 
-/// Database list result.
-pub struct VmIoDbListResult {
-    /// entry class identifier
-    pub class: String,
+/// Specify how the list should be filtered.
+pub enum VmIoDbListFilter {
+    /// Do not filter, get all items.
+    All,
 
-    /// entry key identifier
-    pub key: String,
+    /// Filter by key prefix.
+    KeyPrefix(String),
+
+    /// Filter by modified_at_micros range.
+    ModifiedAtMicrosRange {
+        /// start of filter range.
+        start: std::ops::Bound<i64>,
+
+        /// end of filter range.
+        end: std::ops::Bound<i64>,
+    },
+}
+
+/// Specify how the list should be sorted.
+pub enum VmIoDbListSort {
+    /// default sorting by key ascending
+    KeyAsc,
+
+    /// default sorting by key descending
+    KeyDesc,
+
+    /// by modified_at_micros ascending
+    ModifiedAtMicrosAsc,
+
+    /// by modified_at_micros descending
+    ModifiedAtMicrosDesc,
 }
 
 /// v-m.io all service runtime database
@@ -57,6 +81,9 @@ impl VmIoDb {
         sql_path.push("db.sqlite");
 
         let sql = sql::Sql::new(sql_path, encryption_key.clone()).await?;
+
+        // TODO - set up a background task to slowly remove orphan files
+        //        and clean up empty hash directories
 
         Ok(Self {
             root_dir,
@@ -116,9 +143,6 @@ impl VmIoDb {
 
         let hash: [u8; 32] = sha2::Sha256::digest(&data).into();
 
-        let path = blob::gen_path(&self.root_dir, &class, &key, idx, &hash);
-        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-
         let blob::EncryptResult { nonce, tag } = blob::encrypt_chunk(
             &class,
             &key,
@@ -128,6 +152,10 @@ impl VmIoDb {
             &self.encryption_key,
             is_final,
         )?;
+
+        let path = blob::gen_path(&self.root_dir, &class, &key, idx, &hash);
+        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+        tokio::fs::write(path, &data).await?;
 
         self.sql
             .upsert_chunk(
@@ -141,8 +169,8 @@ impl VmIoDb {
                 is_final,
             )
             .await?;
-
-        tokio::fs::write(path, &data).await?;
+        // question: do we want to delete file on error of the upsert?
+        // question: if upsert was update do we want to delete old file?
 
         Ok(())
     }
@@ -159,6 +187,7 @@ impl VmIoDb {
                 &chunk.hash,
             );
             tokio::fs::remove_file(path).await?;
+            // question: do we want to proactively clean up empty hash dirs?
         }
         Ok(())
     }
@@ -194,6 +223,10 @@ impl VmIoDb {
             blob::gen_path(&self.root_dir, &class, &key, idx, &chunk.hash);
         let mut data = tokio::fs::read(path).await?;
 
+        if data.len() != chunk.size as usize {
+            return Err(std::io::Error::other("corrupted chunk"));
+        }
+
         blob::decrypt_chunk(
             &class,
             &key,
@@ -207,6 +240,17 @@ impl VmIoDb {
         )?;
 
         Ok(Some(data))
+    }
+
+    /// List entries.
+    pub async fn list(
+        &self,
+        class: String,
+        filter: VmIoDbListFilter,
+        sort: VmIoDbListSort,
+        limit: i64,
+    ) -> Result<Vec<VmIoDbEntry>> {
+        self.sql.list(class, filter, sort, limit).await
     }
 }
 
@@ -238,6 +282,18 @@ mod tests {
 
         let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
         assert_eq!(1, e.chunk_count);
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(1, l.len());
+        assert_eq!(1, l[0].chunk_count);
 
         let c = db
             .get_chunk("c".into(), "k".into(), 0, true)

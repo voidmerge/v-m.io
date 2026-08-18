@@ -12,7 +12,6 @@ const SCHEMA: &str = include_str!("sql/schema.sql");
 const UPSERT: &str = include_str!("sql/upsert.sql");
 const UPSERT_CHUNK: &str = include_str!("sql/upsert_chunk.sql");
 const GET_ENTRY: &str = include_str!("sql/get_entry.sql");
-const GET_CHUNK_COUNT: &str = include_str!("sql/get_chunk_count.sql");
 const GET_CHUNK: &str = include_str!("sql/get_chunk.sql");
 
 pub fn sqlite_key(
@@ -247,35 +246,24 @@ WHERE class = ?1 AND key = ?2;
         tokio::task::spawn_blocking(move || {
             let mut c_read = c_read_pool.get();
             let tx = c_read.transaction().map_err(std::io::Error::other)?;
-
-            let mut entry = match tx.query_one(
+            match tx.query_one(
                 GET_ENTRY,
                 rusqlite::params![class, key],
                 |row| {
                     Ok(super::VmIoDbEntry {
-                        class: class.clone(),
-                        key: key.clone(),
+                        class: class.to_string(),
+                        key: key.to_string(),
                         modified_at_micros: row.get(0)?,
                         expires_at_micros: row.get(1)?,
                         metadata: row.get(2)?,
-                        chunk_count: 0,
+                        chunk_count: row.get(3)?,
                     })
                 },
             ) {
                 Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
                 Err(err) => return Err(std::io::Error::other(err)),
-                Ok(entry) => entry,
-            };
-
-            if let Ok(count) = tx.query_one(
-                GET_CHUNK_COUNT,
-                rusqlite::params![class, key],
-                |row| row.get::<_, i64>(0),
-            ) {
-                entry.chunk_count = count;
+                Ok(entry) => Ok(Some(entry)),
             }
-
-            Ok(Some(entry))
         })
         .await
         .expect("blocking thread error")
@@ -319,43 +307,121 @@ WHERE class = ?1 AND key = ?2;
     /// List entries.
     pub async fn list(
         &self,
-        class: &str,
-        filter: ListFilter,
-        sort: ListSort,
+        class: String,
+        filter: super::VmIoDbListFilter,
+        sort: super::VmIoDbListSort,
         limit: i64,
-    ) -> Result<Vec<super::VmIoDbListResult>> {
-        todo!()
+    ) -> Result<Vec<super::VmIoDbEntry>> {
+        let c_read_pool = self.c_read_pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c_read = c_read_pool.get();
+            let tx = c_read.transaction().map_err(std::io::Error::other)?;
+
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(class.clone())];
+
+            let mut list_sql = "
+SELECT
+  key,
+  modified_at_micros,
+  expires_at_micros,
+  metadata,
+  (
+    SELECT COUNT(idx)
+    FROM entry_file_chunks
+    WHERE class = entries.class AND key = entries.key
+  ) AS chunk_count
+FROM entries
+WHERE class = ?1"
+                .to_string();
+
+            match filter {
+                super::VmIoDbListFilter::All => (),
+                super::VmIoDbListFilter::KeyPrefix(_prefix) => {
+                    todo!()
+                }
+                super::VmIoDbListFilter::ModifiedAtMicrosRange {
+                    start,
+                    end,
+                } => {
+                    list_sql.push_str(" AND modified_at_micros");
+                    match start {
+                        std::ops::Bound::Unbounded => {
+                            params.push(Box::new(0_i64));
+                            list_sql.push_str(&format!(" >= ?{}", params.len()))
+                        }
+                        std::ops::Bound::Included(t) => {
+                            params.push(Box::new(t));
+                            list_sql.push_str(&format!(" >= ?{}", params.len()))
+                        }
+                        std::ops::Bound::Excluded(t) => {
+                            params.push(Box::new(t));
+                            list_sql.push_str(&format!(" > ?{}", params.len()))
+                        }
+                    }
+                    list_sql.push_str(" AND modified_at_micros");
+                    match end {
+                        std::ops::Bound::Unbounded => {
+                            params.push(Box::new(9223372036854775807_i64));
+                            list_sql.push_str(&format!(" <= ?{}", params.len()))
+                        }
+                        std::ops::Bound::Included(t) => {
+                            params.push(Box::new(t));
+                            list_sql.push_str(&format!(" <= ?{}", params.len()))
+                        }
+                        std::ops::Bound::Excluded(t) => {
+                            params.push(Box::new(t));
+                            list_sql.push_str(&format!(" < ?{}", params.len()))
+                        }
+                    }
+                }
+            }
+
+            match sort {
+                super::VmIoDbListSort::KeyAsc => {
+                    list_sql.push_str(" ORDER BY class ASC, key ASC")
+                }
+                super::VmIoDbListSort::KeyDesc => {
+                    list_sql.push_str(" ORDER BY class DESC, key DESC")
+                }
+                super::VmIoDbListSort::ModifiedAtMicrosAsc => {
+                    list_sql.push_str(" ORDER BY modified_at_micros ASC")
+                }
+                super::VmIoDbListSort::ModifiedAtMicrosDesc => {
+                    list_sql.push_str(" ORDER BY modified_at_micros DESC")
+                }
+            }
+
+            params.push(Box::new(limit));
+            list_sql.push_str(&format!(" LIMIT ?{}", params.len()));
+
+            let ref_params: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|b| b.as_ref()).collect();
+
+            let mut out: Vec<super::VmIoDbEntry> = Vec::new();
+            for entry in tx
+                .prepare(&list_sql)
+                .map_err(std::io::Error::other)?
+                .query_map(ref_params.as_slice(), |row| {
+                    Ok(super::VmIoDbEntry {
+                        class: class.to_string(),
+                        key: row.get(0)?,
+                        modified_at_micros: row.get(1)?,
+                        expires_at_micros: row.get(2)?,
+                        metadata: row.get(3)?,
+                        chunk_count: row.get(4)?,
+                    })
+                })
+                .map_err(std::io::Error::other)?
+            {
+                out.push(entry.map_err(std::io::Error::other)?);
+            }
+
+            Ok(out)
+        })
+        .await
+        .expect("blocking thread error")
     }
-}
-
-/// Specify how the list should be filtered.
-pub enum ListFilter {
-    /// Filter by key prefix.
-    KeyPrefix(String),
-
-    /// Filter by modified_at_micros range.
-    ModifiedAtMicrosRange {
-        /// start of filter range.
-        start: std::ops::Bound<i64>,
-
-        /// end of filter range.
-        end: std::ops::Bound<i64>,
-    },
-}
-
-/// Specify how the list should be sorted.
-pub enum ListSort {
-    /// default sorting by key ascending
-    KeyAsc,
-
-    /// default sorting by key descending
-    KeyDesc,
-
-    /// by modified_at_micros ascending
-    ModifiedAtMicrosAsc,
-
-    /// by modified_at_micros descending
-    ModifiedAtMicrosDesc,
 }
 
 /// A database entry file chunk.
