@@ -503,4 +503,271 @@ mod tests {
 
         db.rm("c".into(), "k".into()).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn list_all_is_class_scoped_and_sortable() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        db.upsert("c".into(), "b".into(), 20, None, None)
+            .await
+            .unwrap();
+        db.upsert("c".into(), "a".into(), 10, None, None)
+            .await
+            .unwrap();
+        db.upsert("c".into(), "c".into(), 30, None, None)
+            .await
+            .unwrap();
+        // different class entirely - must never show up in "c" listings
+        db.upsert("other".into(), "z".into(), 40, None, None)
+            .await
+            .unwrap();
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["a", "b", "c"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::KeyDesc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["c", "b", "a"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::ModifiedAtMicrosAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["a", "b", "c"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::ModifiedAtMicrosDesc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["c", "b", "a"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_respects_limit() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        for (i, k) in ["a", "b", "c"].into_iter().enumerate() {
+            db.upsert("c".into(), k.into(), i as i64, None, None)
+                .await
+                .unwrap();
+        }
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::All,
+                VmIoDbListSort::KeyAsc,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["a", "b"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_key_prefix_matches_only_that_prefix() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        for (i, k) in ["dog/1", "dog/2", "cat/1"].into_iter().enumerate() {
+            db.upsert("c".into(), k.into(), i as i64, None, None)
+                .await
+                .unwrap();
+        }
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::KeyPrefix("dog/".into()),
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["dog/1", "dog/2"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_key_prefix_escapes_glob_metacharacters() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        // a naive, unescaped GLOB would treat these prefixes' metacharacters
+        // as wildcards and match far more than the intended literal prefix
+        for (i, k) in
+            ["a*1", "a*2", "aXY", "abc", "b?1", "bZ1", "c[x", "cYx"]
+                .into_iter()
+                .enumerate()
+        {
+            db.upsert("c".into(), k.into(), i as i64, None, None)
+                .await
+                .unwrap();
+        }
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::KeyPrefix("a*".into()),
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["a*1", "a*2"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::KeyPrefix("b?".into()),
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["b?1"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::KeyPrefix("c[".into()),
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["c[x"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_modified_at_micros_range() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        for (k, t) in [("a", 10), ("b", 20), ("c", 30), ("d", 40)] {
+            db.upsert("c".into(), k.into(), t, None, None)
+                .await
+                .unwrap();
+        }
+
+        // inclusive/inclusive
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::ModifiedAtMicrosRange {
+                    start: std::ops::Bound::Included(20),
+                    end: std::ops::Bound::Included(30),
+                },
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["b", "c"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        // exclusive/exclusive narrows both ends by one
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::ModifiedAtMicrosRange {
+                    start: std::ops::Bound::Excluded(10),
+                    end: std::ops::Bound::Excluded(40),
+                },
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["b", "c"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        // unbounded start, bounded end
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::ModifiedAtMicrosRange {
+                    start: std::ops::Bound::Unbounded,
+                    end: std::ops::Bound::Included(20),
+                },
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["a", "b"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+
+        // bounded start, unbounded end
+        let l = db
+            .list(
+                "c".into(),
+                VmIoDbListFilter::ModifiedAtMicrosRange {
+                    start: std::ops::Bound::Included(30),
+                    end: std::ops::Bound::Unbounded,
+                },
+                VmIoDbListSort::KeyAsc,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["c", "d"],
+            l.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+    }
 }

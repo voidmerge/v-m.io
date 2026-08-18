@@ -40,6 +40,27 @@ pub fn key_literal(
     zeroize::Zeroizing::new(hex_buffer)
 }
 
+/// Build a sqlite `GLOB` pattern that matches keys starting with `prefix`.
+///
+/// `GLOB` has no `ESCAPE` clause (unlike `LIKE`), so any of its wildcard
+/// characters (`*`, `?`, `[`) occurring in `prefix` are neutralized by
+/// wrapping them in a single-char character class, e.g. `*` becomes `[*]`.
+fn glob_prefix_pattern(prefix: &str) -> String {
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for c in prefix.chars() {
+        match c {
+            '*' | '?' | '[' => {
+                pattern.push('[');
+                pattern.push(c);
+                pattern.push(']');
+            }
+            _ => pattern.push(c),
+        }
+    }
+    pattern.push('*');
+    pattern
+}
+
 /// sqlite db connection
 pub struct Sql {
     c_write: Arc<Mutex<rusqlite::Connection>>,
@@ -425,8 +446,10 @@ WHERE class = ?1"
 
             match filter {
                 super::VmIoDbListFilter::All => (),
-                super::VmIoDbListFilter::KeyPrefix(_prefix) => {
-                    todo!()
+                super::VmIoDbListFilter::KeyPrefix(prefix) => {
+                    params.push(Box::new(glob_prefix_pattern(&prefix)));
+                    list_sql
+                        .push_str(&format!(" AND key GLOB ?{}", params.len()));
                 }
                 super::VmIoDbListFilter::ModifiedAtMicrosRange {
                     start,
