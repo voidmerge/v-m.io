@@ -6,6 +6,7 @@ use std::io::Result;
 use std::sync::Arc;
 
 mod blob;
+mod key;
 mod sql;
 
 /// Database entry.
@@ -70,7 +71,9 @@ pub enum VmIoDbListSort {
 pub struct VmIoDb {
     root_dir: std::path::PathBuf,
     sql: Arc<sql::Sql>,
-    encryption_key: zeroize::Zeroizing<[u8; 32]>,
+
+    // the blob sub key, not the caller's master key
+    blob_key: zeroize::Zeroizing<[u8; 32]>,
 
     // dropping the set aborts the background tasks with the database
     _tasks: tokio::task::JoinSet<()>,
@@ -225,6 +228,9 @@ fn cleanup_dir<'a>(
 
 impl VmIoDb {
     /// Construct a new database.
+    ///
+    /// `encryption_key` is a master key. It is split into independent sub keys
+    /// for the database and for entry file blobs, and is not itself retained.
     pub async fn new<P: Into<std::path::PathBuf>>(
         root_dir: P,
         encryption_key: zeroize::Zeroizing<[u8; 32]>,
@@ -235,8 +241,10 @@ impl VmIoDb {
         let mut sql_path = root_dir.clone();
         sql_path.push("db.sqlite");
 
-        let sql =
-            Arc::new(sql::Sql::new(sql_path, encryption_key.clone()).await?);
+        let keys = key::RootKeys::derive(&encryption_key);
+        drop(encryption_key);
+
+        let sql = Arc::new(sql::Sql::new(sql_path, keys.sqlite).await?);
 
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(prune_task(root_dir.clone(), sql.clone()));
@@ -245,7 +253,7 @@ impl VmIoDb {
         Ok(Self {
             root_dir,
             sql,
-            encryption_key: encryption_key.into(),
+            blob_key: keys.blob,
             _tasks: tasks,
         })
     }
@@ -301,25 +309,32 @@ impl VmIoDb {
 
         let hash: [u8; 32] = sha2::Sha256::digest(&data).into();
 
-        // TODO - edge case if we are re-writing the exact same chunk here
-        //        the same hash, but new encrypted nonce is written before
-        //        updating the database... a crash can make the data unreadable
-        //        instead we may want to check for pre-existing match
-        //        and just keep the current one?
-
-        let blob::EncryptResult { nonce, tag } = blob::encrypt_chunk(
-            &class,
-            &key,
-            idx,
+        let blob::EncryptResult { id: blob_id, tag } = blob::encrypt_chunk(
+            &blob::ChunkId {
+                class: &class,
+                key: &key,
+                idx,
+                hash: &hash,
+                is_final,
+            },
             &mut data[..],
-            &hash,
-            &self.encryption_key,
-            is_final,
-        )?;
+            &self.blob_key,
+        );
 
-        let blob_id = blob::gen_id(&class, &key, idx, &hash);
         let path = blob::id_path(&self.root_dir, &blob_id);
-        blob::write(&path, &data).await?;
+
+        // a blob's contents are a pure function of the path it lives at, so a
+        // file already there at full length is byte for byte what we would
+        // write. skipping the write keeps blobs write once: it cannot truncate
+        // a file that a committed row still depends on, which is what made
+        // rewriting the same chunk risky when nonces were random
+        let wrote = match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.len() == data.len() as u64 => false,
+            _ => {
+                blob::write(&path, &data).await?;
+                true
+            }
+        };
 
         match self
             .sql
@@ -329,7 +344,6 @@ impl VmIoDb {
                 idx,
                 blob_id,
                 hash,
-                nonce,
                 tag,
                 data.len() as i64,
                 is_final,
@@ -337,7 +351,10 @@ impl VmIoDb {
             .await
         {
             Err(err) => {
-                let _ = tokio::fs::remove_file(&path).await;
+                // only ours to remove if this call is what put it there
+                if wrote {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
                 Err(err)
             }
             Ok(prev) => {
@@ -396,8 +413,18 @@ impl VmIoDb {
             return Err(std::io::Error::other("chunk finality mismatch"));
         }
 
-        let path =
-            blob::gen_path(&self.root_dir, &class, &key, idx, &chunk.hash);
+        let chunk_id = blob::ChunkId {
+            class: &class,
+            key: &key,
+            idx,
+            hash: &chunk.hash,
+            is_final,
+        };
+
+        let path = blob::id_path(
+            &self.root_dir,
+            &blob::gen_id(&chunk_id, &self.blob_key),
+        );
         let mut data = tokio::fs::read(path).await?;
 
         if data.len() != chunk.size as usize {
@@ -405,14 +432,9 @@ impl VmIoDb {
         }
 
         blob::decrypt_chunk(
-            &class,
-            &key,
-            idx,
+            &chunk_id,
             &mut data[..],
-            &chunk.hash,
-            &self.encryption_key,
-            is_final,
-            &chunk.nonce,
+            &self.blob_key,
             &chunk.tag,
         )?;
 

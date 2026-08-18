@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS entry_file_chunks (
   -- indexed to answer "is this file still referenced?"
   blob_id BLOB NOT NULL,
   hash BLOB NOT NULL,
-  nonce BLOB NOT NULL,
+  -- no nonce column: the nonce is derived from the chunk identity under the
+  -- master key, so storing it would only invite the row and the file to
+  -- disagree
   tag BLOB NOT NULL,
   size INT NOT NULL,
   is_final BOOLEAN NOT NULL DEFAULT FALSE,

@@ -19,7 +19,10 @@ const PRUNE_EXPIRED: &str = include_str!("sql/prune_expired.sql");
 const PRUNE_EXPIRED_BLOB_IDS: &str =
     include_str!("sql/prune_expired_blob_ids.sql");
 
-pub fn sqlite_key(
+/// Render a key as the `x'<hex>'` literal that selects sqlcipher's raw key
+/// mode, which uses the given bytes directly instead of running them through
+/// a passphrase kdf.
+pub fn key_literal(
     secret: &zeroize::Zeroizing<[u8; 32]>,
 ) -> zeroize::Zeroizing<[u8; 67]> {
     let mut hex_buffer = [0u8; 67];
@@ -47,7 +50,7 @@ impl Sql {
     /// Construct a new db connection pool.
     pub async fn new<P: Into<std::path::PathBuf>>(
         path: P,
-        encryption_key: zeroize::Zeroizing<[u8; 32]>,
+        sqlite_key: zeroize::Zeroizing<[u8; 32]>,
     ) -> Result<Self> {
         let path = path.into();
         tokio::task::spawn_blocking(move || {
@@ -60,7 +63,7 @@ impl Sql {
             )
             .map_err(std::io::Error::other)?;
 
-            let hex_key = sqlite_key(&encryption_key);
+            let hex_key = key_literal(&sqlite_key);
             let hex_key = std::str::from_utf8(&hex_key[..]).unwrap();
 
             c_write
@@ -172,7 +175,6 @@ impl Sql {
         idx: i64,
         blob_id: [u8; 32],
         hash: [u8; 32],
-        nonce: [u8; 32],
         tag: [u8; 32],
         size: i64,
         is_final: bool,
@@ -199,7 +201,7 @@ impl Sql {
             tx.execute(
                 UPSERT_CHUNK,
                 rusqlite::params![
-                    class, key, idx, blob_id, hash, nonce, tag, size, is_final,
+                    class, key, idx, blob_id, hash, tag, size, is_final,
                 ],
             )
             .map_err(std::io::Error::other)?;
@@ -375,10 +377,9 @@ WHERE class = ?1 AND key = ?2;
                 |row| {
                     Ok(Chunk {
                         hash: row.get(0)?,
-                        nonce: row.get(1)?,
-                        tag: row.get(2)?,
-                        size: row.get(3)?,
-                        is_final: row.get(4)?,
+                        tag: row.get(1)?,
+                        size: row.get(2)?,
+                        is_final: row.get(3)?,
                     })
                 },
             ) {
@@ -515,9 +516,6 @@ WHERE class = ?1"
 pub struct Chunk {
     /// sha256 hash of chunk content
     pub hash: [u8; 32],
-
-    /// aegis256 nonce
-    pub nonce: [u8; 32],
 
     /// aegis256 tag
     pub tag: [u8; 32],

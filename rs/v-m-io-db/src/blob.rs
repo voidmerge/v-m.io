@@ -1,5 +1,3 @@
-use rand::RngExt;
-use sha2::Digest;
 use std::io::Result;
 
 /// Count of shard directory levels between the root and a blob file.
@@ -8,17 +6,111 @@ pub const SHARD_DEPTH: usize = 3;
 /// Length of a single shard directory name.
 const SHARD_LEN: usize = 4;
 
+/// Domain separation labels for the chunk key schedule.
+///
+/// Each derived output gets its own label so the outputs are computationally
+/// independent. The id in particular is published as a filename, so it must
+/// reveal nothing about the key or nonce derived from the same identity.
+const INFO_ID: &[u8] = b"v-m.io blob id v1";
+const INFO_KEY: &[u8] = b"v-m.io blob key v1";
+const INFO_NONCE: &[u8] = b"v-m.io blob nonce v1";
+
+/// Everything about an entry file chunk that its blob is bound to.
+pub struct ChunkId<'a> {
+    /// entry class identifier
+    pub class: &'a str,
+
+    /// entry key identifier
+    pub key: &'a str,
+
+    /// chunk index
+    pub idx: i64,
+
+    /// sha256 hash of the chunk plaintext
+    pub hash: &'a [u8; 32],
+
+    /// is this the last chunk of the file?
+    pub is_final: bool,
+}
+
+/// Key schedule for one chunk's blob, derived by [ChunkId::derive].
+struct ChunkKeys {
+    /// names the blob file on disk
+    id: [u8; 32],
+
+    /// aegis256 key
+    key: zeroize::Zeroizing<[u8; 32]>,
+
+    /// aegis256 nonce
+    nonce: [u8; 32],
+
+    /// aegis256 associated data
+    adata: Vec<u8>,
+}
+
+impl ChunkId<'_> {
+    /// Length framed encoding of this chunk identity.
+    ///
+    /// Every variable length field is length prefixed, which makes the
+    /// encoding injective - distinct identities cannot encode to the same
+    /// bytes. Plain concatenation cannot promise that: class "a" with key "b"
+    /// and class "ab" with an empty key both concatenate to "ab", which would
+    /// hand two unrelated entries the same blob file.
+    fn frame(&self) -> Vec<u8> {
+        let class = self.class.as_bytes();
+        let key = self.key.as_bytes();
+
+        let mut out =
+            Vec::with_capacity(8 + class.len() + 8 + key.len() + 8 + 32 + 1);
+
+        out.extend_from_slice(&(class.len() as u64).to_le_bytes());
+        out.extend_from_slice(class);
+        out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        out.extend_from_slice(key);
+
+        // fixed width from here on, so no length prefixes are needed
+        out.extend_from_slice(&self.idx.to_le_bytes());
+        out.extend_from_slice(self.hash);
+        out.push(self.is_final as u8);
+
+        out
+    }
+
+    /// Derive this chunk's blob id, key, nonce and associated data.
+    fn derive(&self, blob_key: &[u8; 32]) -> ChunkKeys {
+        use hkdf::Hkdf;
+
+        let adata = self.frame();
+
+        // the framed identity is the salt, so the extracted prk is already
+        // bound to this one chunk, with the blob sub key as the ikm
+        let hk = Hkdf::<sha2::Sha256>::new(Some(&adata), blob_key);
+
+        let mut keys = ChunkKeys {
+            id: [0; 32],
+            key: zeroize::Zeroizing::new([0; 32]),
+            nonce: [0; 32],
+            adata,
+        };
+
+        // expand only fails on absurd output lengths
+        hk.expand(INFO_ID, &mut keys.id).unwrap();
+        hk.expand(INFO_KEY, &mut *keys.key).unwrap();
+        hk.expand(INFO_NONCE, &mut keys.nonce).unwrap();
+
+        keys
+    }
+}
+
 /// Identifier of the blob file backing a single entry file chunk.
 ///
-/// This is stored alongside the chunk row so the cleanup task can map a
-/// file found on disk back to the row that references it.
-pub fn gen_id(class: &str, key: &str, idx: i64, hash: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(class.as_bytes());
-    hasher.update(key.as_bytes());
-    hasher.update(idx.to_le_bytes());
-    hasher.update(hash);
-    hasher.finalize().into()
+/// This is stored alongside the chunk row so the cleanup task can map a file
+/// found on disk back to the row that references it. It is derived under the
+/// blob sub key, so it cannot be predicted from the entry identity and content
+/// alone - an attacker holding the directory but not the key cannot confirm a
+/// guessed chunk by checking whether its filename exists.
+pub fn gen_id(chunk: &ChunkId, blob_key: &[u8; 32]) -> [u8; 32] {
+    chunk.derive(blob_key).id
 }
 
 /// Path of the blob file with the given id.
@@ -32,16 +124,6 @@ pub fn id_path(
         .join(&hex[SHARD_LEN..SHARD_LEN * 2])
         .join(&hex[SHARD_LEN * 2..SHARD_LEN * 3])
         .join(&hex)
-}
-
-pub fn gen_path(
-    root_dir: &std::path::Path,
-    class: &str,
-    key: &str,
-    idx: i64,
-    hash: &[u8; 32],
-) -> std::path::PathBuf {
-    id_path(root_dir, &gen_id(class, key, idx, hash))
 }
 
 /// Is this the name of a shard directory in the blob layout?
@@ -70,77 +152,51 @@ pub async fn write(path: &std::path::Path, data: &[u8]) -> Result<()> {
     Err(std::io::Error::other("blob shard removed during write"))
 }
 
-fn make_adata(
-    class: &str,
-    key: &str,
-    idx: i64,
-    hash: &[u8; 32],
-    is_final: bool,
-) -> Vec<u8> {
-    let mut adata =
-        format!("{}\0{}\0{}\0{}\0", class, key, idx, is_final,).into_bytes();
-    adata.extend_from_slice(hash);
-    adata
-}
-
-fn derive_sub_key(
-    idx: i64,
-    hash: &[u8; 32],
-    encryption_key: &[u8; 32],
-) -> [u8; 32] {
-    use hkdf::Hkdf;
-
-    let hk =
-        Hkdf::<sha2::Sha256>::new(Some(&idx.to_le_bytes()), encryption_key);
-    let mut sub_key = [0_u8; 32];
-    hk.expand(hash, &mut sub_key).unwrap();
-
-    sub_key
-}
-
+/// Result of [encrypt_chunk].
 pub struct EncryptResult {
-    pub nonce: [u8; 32],
+    /// names the blob file the ciphertext belongs at
+    pub id: [u8; 32],
+
+    /// aegis256 tag, to be stored in sql
     pub tag: [u8; 32],
 }
 
+/// Encrypt a chunk in place.
+///
+/// The nonce is derived rather than random, which makes the ciphertext a pure
+/// function of the chunk identity: writing the same chunk twice produces
+/// byte identical output at a byte identical path, so a blob file is never
+/// meaningfully rewritten. That is what lets [crate::VmIoDb::upsert_chunk]
+/// treat blobs as write once.
+///
+/// A derived nonce is safe here because the key is derived from the same
+/// identity, which includes the plaintext hash. Equal key and nonce therefore
+/// implies equal plaintext, so the pair can never be reused across differing
+/// plaintexts - the one thing an AEAD nonce must rule out.
 pub fn encrypt_chunk(
-    class: &str,
-    key: &str,
-    idx: i64,
+    chunk: &ChunkId,
     data: &mut [u8],
-    hash: &[u8; 32],
-    encryption_key: &[u8; 32],
-    is_final: bool,
-) -> Result<EncryptResult> {
-    let sub_key = derive_sub_key(idx, hash, encryption_key);
+    blob_key: &[u8; 32],
+) -> EncryptResult {
+    let keys = chunk.derive(blob_key);
 
-    let mut nonce = [0; 32];
-    rand::rng().fill(&mut nonce);
-    let adata = make_adata(class, key, idx, hash, is_final);
+    let enc = <aegis::aegis256::Aegis256<32>>::new(&keys.key, &keys.nonce);
+    let tag = enc.encrypt_in_place(data, &keys.adata);
 
-    let enc = <aegis::aegis256::Aegis256<32>>::new(&sub_key, &nonce);
-    let tag = enc.encrypt_in_place(data, &adata);
-
-    Ok(EncryptResult { nonce, tag })
+    EncryptResult { id: keys.id, tag }
 }
 
+/// Decrypt a chunk in place, verifying it against `tag`.
 pub fn decrypt_chunk(
-    class: &str,
-    key: &str,
-    idx: i64,
+    chunk: &ChunkId,
     data: &mut [u8],
-    hash: &[u8; 32],
-    encryption_key: &[u8; 32],
-    is_final: bool,
-    nonce: &[u8; 32],
+    blob_key: &[u8; 32],
     tag: &[u8; 32],
 ) -> Result<()> {
-    let sub_key = derive_sub_key(idx, hash, encryption_key);
+    let keys = chunk.derive(blob_key);
 
-    let adata = make_adata(class, key, idx, hash, is_final);
+    let dec = <aegis::aegis256::Aegis256<32>>::new(&keys.key, &keys.nonce);
 
-    let dec = <aegis::aegis256::Aegis256<32>>::new(&sub_key, nonce);
-
-    dec.decrypt_in_place(data, tag, &adata)
+    dec.decrypt_in_place(data, tag, &keys.adata)
         .map_err(std::io::Error::other)
 }

@@ -1,6 +1,5 @@
 SELECT
   hash,
-  nonce,
   tag,
   size,
   is_final
