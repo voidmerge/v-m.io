@@ -107,8 +107,7 @@ async fn prune_backlog(
             // best effort - these are unreferenced now, so anything we fail
             // to remove here is collected by the cleanup task
             let _ =
-                tokio::fs::remove_file(blob::id_path(root_dir, &blob_id))
-                    .await;
+                tokio::fs::remove_file(blob::id_path(root_dir, &blob_id)).await;
         }
 
         if count < PRUNE_BATCH as usize {
@@ -599,12 +598,7 @@ mod tests {
         }
 
         let l = db
-            .list(
-                "c".into(),
-                VmIoDbListFilter::All,
-                VmIoDbListSort::KeyAsc,
-                2,
-            )
+            .list("c".into(), VmIoDbListFilter::All, VmIoDbListSort::KeyAsc, 2)
             .await
             .unwrap();
         assert_eq!(
@@ -644,10 +638,9 @@ mod tests {
 
         // a naive, unescaped GLOB would treat these prefixes' metacharacters
         // as wildcards and match far more than the intended literal prefix
-        for (i, k) in
-            ["a*1", "a*2", "aXY", "abc", "b?1", "bZ1", "c[x", "cYx"]
-                .into_iter()
-                .enumerate()
+        for (i, k) in ["a*1", "a*2", "aXY", "abc", "b?1", "bZ1", "c[x", "cYx"]
+            .into_iter()
+            .enumerate()
         {
             db.upsert("c".into(), k.into(), i as i64, None, None)
                 .await
@@ -795,15 +788,9 @@ mod tests {
                 .is_err()
         );
         assert!(
-            db.upsert(
-                "c".into(),
-                "k".into(),
-                1,
-                None,
-                Some(vec![0; 4097]),
-            )
-            .await
-            .is_err()
+            db.upsert("c".into(), "k".into(), 1, None, Some(vec![0; 4097]),)
+                .await
+                .is_err()
         );
 
         // nothing should have been written by the failed calls above
@@ -863,7 +850,12 @@ mod tests {
     async fn get_returns_none_for_missing_entry() {
         let (db, _dir) = make_db().await.unwrap();
 
-        assert!(db.get("c".into(), "missing".into()).await.unwrap().is_none());
+        assert!(
+            db.get("c".into(), "missing".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         db.upsert("c".into(), "k".into(), 1, None, None)
             .await
@@ -899,7 +891,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            db.get_chunk("c".into(), "k".into(), 0, false).await.is_err()
+            db.get_chunk("c".into(), "k".into(), 0, false)
+                .await
+                .is_err()
         );
     }
 
@@ -950,7 +944,13 @@ mod tests {
     ) -> std::path::PathBuf {
         let hash: [u8; 32] = sha2::Sha256::digest(data).into();
         let id = blob::gen_id(
-            &blob::ChunkId { class, key, idx, hash: &hash, is_final },
+            &blob::ChunkId {
+                class,
+                key,
+                idx,
+                hash: &hash,
+                is_final,
+            },
             &db.blob_key,
         );
         blob::id_path(&db.root_dir, &id)
@@ -1026,28 +1026,16 @@ mod tests {
         db.upsert("c".into(), "expired".into(), 1, None, None)
             .await
             .unwrap();
-        db.upsert_chunk(
-            "c".into(),
-            "expired".into(),
-            0,
-            b"old".to_vec(),
-            true,
-        )
-        .await
-        .unwrap();
+        db.upsert_chunk("c".into(), "expired".into(), 0, b"old".to_vec(), true)
+            .await
+            .unwrap();
         let blob_path = chunk_blob_path(&db, "c", "expired", 0, b"old", true);
         assert!(tokio::fs::metadata(&blob_path).await.is_ok());
 
         // now mark it expired
-        db.upsert(
-            "c".into(),
-            "expired".into(),
-            4,
-            Some(now - 1_000_000),
-            None,
-        )
-        .await
-        .unwrap();
+        db.upsert("c".into(), "expired".into(), 4, Some(now - 1_000_000), None)
+            .await
+            .unwrap();
 
         db.upsert(
             "c".into(),
@@ -1065,13 +1053,17 @@ mod tests {
         prune_backlog(&db.root_dir, &db.sql).await.unwrap();
 
         assert!(
-            db.get("c".into(), "expired".into()).await.unwrap().is_none()
+            db.get("c".into(), "expired".into())
+                .await
+                .unwrap()
+                .is_none()
         );
+        assert!(db.get("c".into(), "future".into()).await.unwrap().is_some());
         assert!(
-            db.get("c".into(), "future".into()).await.unwrap().is_some()
-        );
-        assert!(
-            db.get("c".into(), "forever".into()).await.unwrap().is_some()
+            db.get("c".into(), "forever".into())
+                .await
+                .unwrap()
+                .is_some()
         );
 
         // prune_backlog removes the blob file directly; the now-empty shard
@@ -1136,8 +1128,8 @@ mod tests {
 
         // a cutoff in the future makes everything just written look past
         // its grace period, without having to sleep out CLEANUP_GRACE
-        let cutoff = std::time::SystemTime::now()
-            + std::time::Duration::from_secs(5);
+        let cutoff =
+            std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         cleanup_dir(&db.root_dir, &db.sql, db.root_dir.clone(), 0, cutoff)
             .await
             .unwrap();
@@ -1164,8 +1156,8 @@ mod tests {
         // a cutoff well in the past means nothing just written qualifies as
         // stale yet, mirroring a real pass that runs before CLEANUP_GRACE
         // has elapsed
-        let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(3600);
+        let cutoff =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         cleanup_dir(&db.root_dir, &db.sql, db.root_dir.clone(), 0, cutoff)
             .await
             .unwrap();

@@ -88,7 +88,7 @@ impl Sql {
             let hex_key = std::str::from_utf8(&hex_key[..]).unwrap();
 
             c_write
-                .pragma_update(None, "key", &hex_key)
+                .pragma_update(None, "key", hex_key)
                 .map_err(std::io::Error::other)?;
             c_write
                 .execute_batch(PRAGMA)
@@ -106,7 +106,7 @@ impl Sql {
             .map_err(std::io::Error::other)?;
 
             c_read_1
-                .pragma_update(None, "key", &hex_key)
+                .pragma_update(None, "key", hex_key)
                 .map_err(std::io::Error::other)?;
             c_read_1
                 .execute_batch(PRAGMA)
@@ -121,7 +121,7 @@ impl Sql {
             .map_err(std::io::Error::other)?;
 
             c_read_2
-                .pragma_update(None, "key", &hex_key)
+                .pragma_update(None, "key", hex_key)
                 .map_err(std::io::Error::other)?;
             c_read_2
                 .execute_batch(PRAGMA)
@@ -136,7 +136,7 @@ impl Sql {
             .map_err(std::io::Error::other)?;
 
             c_read_3
-                .pragma_update(None, "key", &hex_key)
+                .pragma_update(None, "key", hex_key)
                 .map_err(std::io::Error::other)?;
             c_read_3
                 .execute_batch(PRAGMA)
@@ -371,8 +371,8 @@ WHERE class = ?1 AND key = ?2;
                     })
                 },
             ) {
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(err) => return Err(std::io::Error::other(err)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(std::io::Error::other(err)),
                 Ok(entry) => Ok(Some(entry)),
             }
         })

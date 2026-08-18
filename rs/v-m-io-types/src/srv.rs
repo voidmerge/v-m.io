@@ -1,16 +1,17 @@
 //! server types
 
 use std::collections::BTreeSet;
+use std::io::Result;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use hyper::header::{AUTHORIZATION, HeaderValue};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
+use hyper::header::{AUTHORIZATION, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use std::io::Result;
-use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 const MAX_BODY: usize = 16 * 1024 * 1024; // 16 MiB
@@ -21,7 +22,7 @@ async fn handle_request(
     let auth_header = req.headers().get(AUTHORIZATION);
 
     if let Err(err_resp) = validate_token(auth_header) {
-        return Ok(err_resp);
+        return Ok(*err_resp);
     }
 
     let body = req.into_body();
@@ -54,16 +55,20 @@ async fn handle_request(
     )))))
 }
 
-fn validate_token(auth_header: Option<&HeaderValue>) -> std::result::Result<(), Response<Full<Bytes>>> {
+fn validate_token(
+    auth_header: Option<&HeaderValue>,
+) -> std::result::Result<(), Box<Response<Full<Bytes>>>> {
     let build_error = |msg: &'static str| {
         let mut res = Response::new(Full::new(Bytes::from(msg)));
         *res.status_mut() = StatusCode::UNAUTHORIZED;
-        res
+        Box::new(res)
     };
 
     let header_val = match auth_header {
         Some(val) => val,
-        None => return Err(build_error("Error: Missing Authorization header.")),
+        None => {
+            return Err(build_error("Error: Missing Authorization header."));
+        }
     };
 
     let header_str = match header_val.to_str() {
@@ -72,7 +77,9 @@ fn validate_token(auth_header: Option<&HeaderValue>) -> std::result::Result<(), 
     };
 
     if !header_str.starts_with("Bearer ") {
-        return Err(build_error("Error: Authorization format must be 'Bearer <token>'."));
+        return Err(build_error(
+            "Error: Authorization format must be 'Bearer <token>'.",
+        ));
     }
 
     let token = &header_str[7..];
@@ -85,17 +92,68 @@ fn validate_token(auth_header: Option<&HeaderValue>) -> std::result::Result<(), 
 }
 
 /// Start a server.
-pub async fn serve() -> Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-    let listener = TcpListener::bind(addr).await?;
-    println!("Listening on http://{}", addr);
+pub async fn serve(bind: Vec<SocketAddr>) -> Result<()> {
+    let limit = Arc::new(tokio::sync::Semaphore::new(2048));
+
+    let listeners = futures_util::future::try_join_all(
+        bind.into_iter().map(TcpListener::bind),
+    )
+    .await?
+    .into_iter()
+    .map(|listener| {
+        println!(
+            "listening on: http://{}",
+            listener.local_addr().expect("local addr")
+        );
+        tokio_stream::wrappers::TcpListenerStream::new(listener)
+    });
+
+    let mut listeners = futures_util::stream::select_all(listeners);
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        use futures_util::StreamExt;
+
+        let stream = match listeners.next().await {
+            None => return Err(std::io::Error::other("all listeners halted")),
+            Some(s) => s?,
+        };
+
         let io = TokioIo::new(stream);
+        let limit = limit.clone();
 
         tokio::task::spawn(async move {
             let builder = auto::Builder::new(TokioExecutor::new());
+
+            let _permit = match tokio::time::timeout(
+                std::time::Duration::from_millis(17),
+                limit.clone().acquire_owned(),
+            )
+            .await
+            {
+                Err(_) => {
+                    let _ = builder
+                        .serve_connection(
+                            io,
+                            service_fn(|_| async {
+                                let mut res = Response::new(
+                                    "Service Unavailable".to_string(),
+                                );
+                                *res.status_mut() =
+                                    StatusCode::SERVICE_UNAVAILABLE;
+                                res.headers_mut().insert(
+                                    hyper::header::RETRY_AFTER,
+                                    hyper::header::HeaderValue::from_static(
+                                        "60",
+                                    ),
+                                );
+                                Ok::<_, std::convert::Infallible>(res)
+                            }),
+                        )
+                        .await;
+                    return;
+                }
+                Ok(r) => r.map_err(std::io::Error::other),
+            };
 
             if let Err(err) = builder
                 .serve_connection(io, service_fn(handle_request))
@@ -124,7 +182,7 @@ impl ClusterInfo {
         *self
             .srv_set
             .iter()
-            .nth(gen_shard_index(id, self.srv_set.len()) as usize)
+            .nth(gen_shard_index(id, self.srv_set.len()))
             .unwrap_or_else(|| self.srv_set.first().expect("empty cluster"))
     }
 }

@@ -13,8 +13,10 @@ categories = [ "database", "database-implementations", "network-programming", "w
 
 [dependencies]
 bincode-next = { workspace = true, features = ["serde"] }
+futures-util = { workspace = true }
 hyper = { workspace = true, features = ["server"] }
 hyper-util = { workspace = true, features = ["server", "server-auto", "tokio"] }
 http-body-util = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true, features = ["net"] }

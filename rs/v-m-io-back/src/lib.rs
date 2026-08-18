@@ -86,16 +86,16 @@ impl ThreadScriptCache {
         }
     }
 
-    pub fn get_or_compile<'a>(
+    pub fn get_or_compile(
         &mut self,
-        lua: &'a Lua,
+        lua: &Lua,
         name: &str,
         source: &str,
     ) -> LuaResult<LuaFunction> {
-        if let Some(key) = self.cache.get(name) {
-            if let Ok(func) = lua.registry_value::<LuaFunction>(key) {
-                return Ok(func);
-            }
+        if let Some(key) = self.cache.get(name)
+            && let Ok(func) = lua.registry_value::<LuaFunction>(key)
+        {
+            return Ok(func);
         }
 
         let bytecode_func = lua.load(source).into_function()?;
