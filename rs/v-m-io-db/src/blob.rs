@@ -2,6 +2,38 @@ use rand::RngExt;
 use sha2::Digest;
 use std::io::Result;
 
+/// Count of shard directory levels between the root and a blob file.
+pub const SHARD_DEPTH: usize = 3;
+
+/// Length of a single shard directory name.
+const SHARD_LEN: usize = 4;
+
+/// Identifier of the blob file backing a single entry file chunk.
+///
+/// This is stored alongside the chunk row so the cleanup task can map a
+/// file found on disk back to the row that references it.
+pub fn gen_id(class: &str, key: &str, idx: i64, hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(class.as_bytes());
+    hasher.update(key.as_bytes());
+    hasher.update(idx.to_le_bytes());
+    hasher.update(hash);
+    hasher.finalize().into()
+}
+
+/// Path of the blob file with the given id.
+pub fn id_path(
+    root_dir: &std::path::Path,
+    id: &[u8; 32],
+) -> std::path::PathBuf {
+    let hex = hex::encode(id);
+    root_dir
+        .join(&hex[..SHARD_LEN])
+        .join(&hex[SHARD_LEN..SHARD_LEN * 2])
+        .join(&hex[SHARD_LEN * 2..SHARD_LEN * 3])
+        .join(&hex)
+}
+
 pub fn gen_path(
     root_dir: &std::path::Path,
     class: &str,
@@ -9,21 +41,33 @@ pub fn gen_path(
     idx: i64,
     hash: &[u8; 32],
 ) -> std::path::PathBuf {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(class.as_bytes());
-    hasher.update(key.as_bytes());
-    hasher.update(idx.to_le_bytes());
-    hasher.update(hash);
-    let hex: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    root_dir
-        .join(&hex[..4])
-        .join(&hex[4..8])
-        .join(&hex[8..12])
-        .join(&hex)
+    id_path(root_dir, &gen_id(class, key, idx, hash))
+}
+
+/// Is this the name of a shard directory in the blob layout?
+pub fn is_shard_name(name: &str) -> bool {
+    name.len() == SHARD_LEN && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parse a blob file name back into the blob id it encodes.
+pub fn parse_name(name: &str) -> Option<[u8; 32]> {
+    let mut id = [0; 32];
+    hex::decode_to_slice(name, &mut id).ok()?;
+    Some(id)
+}
+
+/// Write a blob file, creating its shard directories as needed.
+pub async fn write(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    // the cleanup task removes empty shard directories, and can do so
+    // between our create_dir_all and our write, so retry once
+    for _ in 0..2 {
+        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+        match tokio::fs::write(path, data).await {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            res => return res,
+        }
+    }
+    Err(std::io::Error::other("blob shard removed during write"))
 }
 
 fn make_adata(

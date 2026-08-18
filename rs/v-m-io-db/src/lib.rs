@@ -16,10 +16,14 @@ pub struct VmIoDbEntry {
     /// entry key identifier
     pub key: String,
 
-    /// entry created at timestamp in microseconds
+    /// entry created at unix epoch timestamp in microseconds
     pub modified_at_micros: i64,
 
-    /// if specified, entry will be pruned after this timestamp in microseconds
+    /// if specified, entry will be pruned after this unix epoch timestamp in
+    /// microseconds
+    ///
+    /// Pruning is periodic, so an entry remains readable for up to a minute
+    /// past this timestamp.
     pub expires_at_micros: Option<i64>,
 
     /// optional metadata associated with entry
@@ -67,32 +71,156 @@ pub struct VmIoDb {
     root_dir: std::path::PathBuf,
     sql: Arc<sql::Sql>,
     encryption_key: zeroize::Zeroizing<[u8; 32]>,
-    task: tokio::task::AbortHandle,
+
+    // dropping the set aborts the background tasks with the database
+    _tasks: tokio::task::JoinSet<()>,
 }
 
-impl Drop for VmIoDb {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
+/// How long to wait between expiration prune passes.
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-async fn cleanup_task(
-    root_dir: std::path::PathBuf,
-    sql: Arc<sql::Sql>,
-    encryption_key: zeroize::Zeroizing<[u8; 32]>,
-) {
+/// Maximum count of entries pruned in a single transaction.
+///
+/// Pruning holds the exclusive write transaction, so a large backlog of
+/// expirations is worked through in batches rather than stalling writers
+/// behind one long delete.
+const PRUNE_BATCH: i64 = 256;
+
+/// Periodically remove entries that have passed their expiration.
+async fn prune_task(root_dir: std::path::PathBuf, sql: Arc<sql::Sql>) {
     loop {
-        // TODO - loop over hash files, checking for references in sql,
-        //        (add hash index to sql??)
-        //        any unreferenced files with system modified times
-        //        > 1 minute should be safe to delete
+        // drain the backlog a batch at a time before waiting for the next
+        // pass, so a large number of simultaneous expirations does not take
+        // PRUNE_INTERVAL per batch to clear
+        while let Ok(now_micros) = unix_micros() {
+            let (count, blob_ids) =
+                match sql.prune_expired(now_micros, PRUNE_BATCH).await {
+                    // best effort - retry on the next pass
+                    Err(_) => break,
+                    Ok(pruned) => pruned,
+                };
 
-        // TODO - walk the directory (part of same loop above??) any
-        //        empty hash directory with a modified time > 1 minute
-        //        should be safe to remove
+            for blob_id in blob_ids {
+                // best effort - these are unreferenced now, so anything we
+                // fail to remove here is collected by the cleanup task
+                let _ =
+                    tokio::fs::remove_file(blob::id_path(&root_dir, &blob_id))
+                        .await;
+            }
 
-        tokio::time::sleep(std::time::Duration::from_secs(60 * 10)).await;
+            if count < PRUNE_BATCH as usize {
+                break;
+            }
+        }
+
+        tokio::time::sleep(PRUNE_INTERVAL).await;
     }
+}
+
+/// Current unix epoch timestamp in microseconds.
+fn unix_micros() -> Result<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_micros() as i64)
+        .map_err(std::io::Error::other)
+}
+
+/// How long to wait between disk cleanup passes.
+const CLEANUP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60 * 10);
+
+/// Blob files and shard directories are only removed once they have gone
+/// untouched for at least this long.
+///
+/// [VmIoDb::upsert_chunk] writes the blob file *before* committing the sql
+/// row that references it, so a recently written file with no sql reference
+/// may well be a write in flight rather than garbage. The grace period just
+/// has to comfortably exceed the gap between those two steps.
+const CLEANUP_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(60 * 5);
+
+/// Periodically reclaim disk that sql no longer references.
+async fn cleanup_task(root_dir: std::path::PathBuf, sql: Arc<sql::Sql>) {
+    loop {
+        if let Some(cutoff) =
+            std::time::SystemTime::now().checked_sub(CLEANUP_GRACE)
+        {
+            // best effort - io and sql errors abort this pass, and whatever
+            // was missed is picked up by the next one
+            let _ =
+                cleanup_dir(&root_dir, &sql, root_dir.clone(), 0, cutoff).await;
+        }
+
+        tokio::time::sleep(CLEANUP_INTERVAL).await;
+    }
+}
+
+/// Recursive worker for [cleanup_task]. Descends the blob shard tree,
+/// removing unreferenced blob files, then the shard directories they leave
+/// empty behind them.
+fn cleanup_dir<'a>(
+    root_dir: &'a std::path::Path,
+    sql: &'a sql::Sql,
+    dir: std::path::PathBuf,
+    depth: usize,
+    cutoff: std::time::SystemTime,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
+{
+    Box::pin(async move {
+        let mut read_dir = tokio::fs::read_dir(&dir).await?;
+
+        while let Some(item) = read_dir.next_entry().await? {
+            let name = item.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+
+            let Ok(meta) = item.metadata().await else {
+                // vanished out from under us, or otherwise unreadable
+                continue;
+            };
+
+            let stale = meta
+                .modified()
+                .map(|modified| modified <= cutoff)
+                .unwrap_or(false);
+
+            if meta.is_dir() {
+                // only walk our own layout, never anything else that
+                // happens to live in the root dir (the sqlite files)
+                if depth >= blob::SHARD_DEPTH || !blob::is_shard_name(name) {
+                    continue;
+                }
+
+                cleanup_dir(root_dir, sql, item.path(), depth + 1, cutoff)
+                    .await?;
+
+                if stale {
+                    // only succeeds if the recursion above left it empty.
+                    // note that removing children bumps this dir's mtime,
+                    // so its own parent becomes collectable on a later pass
+                    let _ = tokio::fs::remove_dir(item.path()).await;
+                }
+            } else if depth == blob::SHARD_DEPTH && stale {
+                // a blob file is only reachable through the chunk row whose
+                // blob id names it, so no row means no reference
+                let Some(id) = blob::parse_name(name) else {
+                    continue;
+                };
+
+                if blob::id_path(root_dir, &id) != item.path() {
+                    // correctly named but not where we would have put it
+                    continue;
+                }
+
+                if !sql.blob_id_exists(id).await? {
+                    let _ = tokio::fs::remove_file(item.path()).await;
+                }
+            }
+        }
+
+        Ok(())
+    })
 }
 
 impl VmIoDb {
@@ -110,18 +238,15 @@ impl VmIoDb {
         let sql =
             Arc::new(sql::Sql::new(sql_path, encryption_key.clone()).await?);
 
-        let task = tokio::task::spawn(cleanup_task(
-            root_dir.clone(),
-            sql.clone(),
-            encryption_key.clone(),
-        ))
-        .abort_handle();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(prune_task(root_dir.clone(), sql.clone()));
+        tasks.spawn(cleanup_task(root_dir.clone(), sql.clone()));
 
         Ok(Self {
             root_dir,
             sql,
             encryption_key: encryption_key.into(),
-            task,
+            _tasks: tasks,
         })
     }
 
@@ -176,6 +301,12 @@ impl VmIoDb {
 
         let hash: [u8; 32] = sha2::Sha256::digest(&data).into();
 
+        // TODO - edge case if we are re-writing the exact same chunk here
+        //        the same hash, but new encrypted nonce is written before
+        //        updating the database... a crash can make the data unreadable
+        //        instead we may want to check for pre-existing match
+        //        and just keep the current one?
+
         let blob::EncryptResult { nonce, tag } = blob::encrypt_chunk(
             &class,
             &key,
@@ -186,9 +317,9 @@ impl VmIoDb {
             is_final,
         )?;
 
-        let path = blob::gen_path(&self.root_dir, &class, &key, idx, &hash);
-        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-        tokio::fs::write(&path, &data).await?;
+        let blob_id = blob::gen_id(&class, &key, idx, &hash);
+        let path = blob::id_path(&self.root_dir, &blob_id);
+        blob::write(&path, &data).await?;
 
         match self
             .sql
@@ -196,6 +327,7 @@ impl VmIoDb {
                 class,
                 key,
                 idx,
+                blob_id,
                 hash,
                 nonce,
                 tag,
@@ -208,9 +340,17 @@ impl VmIoDb {
                 let _ = tokio::fs::remove_file(&path).await;
                 Err(err)
             }
-            Ok(_) => {
-                // TODO - upsert_chunk should return the old hash
-                //        if it was replaced so we can delete it here
+            Ok(prev) => {
+                if let Some(prev) = prev {
+                    // this chunk index used to point at a different blob,
+                    // which is now unreferenced. best effort - the cleanup
+                    // task collects it if this fails
+                    let _ = tokio::fs::remove_file(blob::id_path(
+                        &self.root_dir,
+                        &prev,
+                    ))
+                    .await;
+                }
                 Ok(())
             }
         }
@@ -218,16 +358,13 @@ impl VmIoDb {
 
     /// Remove an entry.
     pub async fn rm(&self, class: String, key: String) -> Result<()> {
-        let chunks = self.sql.rm(class.clone(), key.clone()).await?;
-        for chunk in chunks {
-            let path = blob::gen_path(
-                &self.root_dir,
-                &class,
-                &key,
-                chunk.idx,
-                &chunk.hash,
-            );
-            tokio::fs::remove_file(path).await?;
+        for blob_id in self.sql.rm(class, key).await? {
+            // best effort - the sql rows are already gone, so anything we
+            // fail to remove here is unreferenced and the cleanup task
+            // collects it
+            let _ =
+                tokio::fs::remove_file(blob::id_path(&self.root_dir, &blob_id))
+                    .await;
         }
         Ok(())
     }

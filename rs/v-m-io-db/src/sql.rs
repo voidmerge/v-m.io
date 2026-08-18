@@ -13,6 +13,11 @@ const UPSERT: &str = include_str!("sql/upsert.sql");
 const UPSERT_CHUNK: &str = include_str!("sql/upsert_chunk.sql");
 const GET_ENTRY: &str = include_str!("sql/get_entry.sql");
 const GET_CHUNK: &str = include_str!("sql/get_chunk.sql");
+const GET_CHUNK_BLOB_ID: &str = include_str!("sql/get_chunk_blob_id.sql");
+const BLOB_ID_EXISTS: &str = include_str!("sql/blob_id_exists.sql");
+const PRUNE_EXPIRED: &str = include_str!("sql/prune_expired.sql");
+const PRUNE_EXPIRED_BLOB_IDS: &str =
+    include_str!("sql/prune_expired_blob_ids.sql");
 
 pub fn sqlite_key(
     secret: &zeroize::Zeroizing<[u8; 32]>,
@@ -156,39 +161,22 @@ impl Sql {
     }
 
     /// Upsert a chunk.
+    ///
+    /// If this replaced a chunk backed by a different blob file, the id of
+    /// that now unreferenced blob is returned so it can be removed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_chunk(
         &self,
         class: String,
         key: String,
         idx: i64,
+        blob_id: [u8; 32],
         hash: [u8; 32],
         nonce: [u8; 32],
         tag: [u8; 32],
         size: i64,
         is_final: bool,
-    ) -> Result<()> {
-        let c_write = self.c_write.clone();
-        tokio::task::spawn_blocking(move || {
-            c_write
-                .lock()
-                .unwrap()
-                .execute(
-                    UPSERT_CHUNK,
-                    rusqlite::params![
-                        class, key, idx, hash, nonce, tag, size, is_final,
-                    ],
-                )
-                .map_err(std::io::Error::other)?;
-            Ok(())
-        })
-        .await
-        .expect("blocking thread error")
-    }
-
-    /// Remove an entry (and all chunk references).
-    ///
-    /// Returns a list of deleted chunks so the file stores can be removed.
-    pub async fn rm(&self, class: String, key: String) -> Result<Vec<Chunk>> {
+    ) -> Result<Option<[u8; 32]>> {
         let c_write = self.c_write.clone();
         tokio::task::spawn_blocking(move || {
             let mut c_write = c_write.lock().unwrap();
@@ -197,29 +185,85 @@ impl Sql {
                     rusqlite::TransactionBehavior::Exclusive,
                 )
                 .map_err(std::io::Error::other)?;
-            let mut out: Vec<Chunk> = Vec::new();
-            for chunk in tx
+
+            let prev: Option<[u8; 32]> = match tx.query_one(
+                GET_CHUNK_BLOB_ID,
+                rusqlite::params![&class, &key, idx],
+                |row| row.get(0),
+            ) {
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(err) => return Err(std::io::Error::other(err)),
+                Ok(prev) => Some(prev),
+            };
+
+            tx.execute(
+                UPSERT_CHUNK,
+                rusqlite::params![
+                    class, key, idx, blob_id, hash, nonce, tag, size, is_final,
+                ],
+            )
+            .map_err(std::io::Error::other)?;
+
+            tx.commit().map_err(std::io::Error::other)?;
+
+            // a rewrite of identical content lands on the same blob file,
+            // in which case there is nothing to clean up
+            Ok(prev.filter(|prev| prev != &blob_id))
+        })
+        .await
+        .expect("blocking thread error")
+    }
+
+    /// Is any chunk still referencing this blob id?
+    pub async fn blob_id_exists(&self, blob_id: [u8; 32]) -> Result<bool> {
+        let c_read_pool = self.c_read_pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let c_read = c_read_pool.get();
+            match c_read.query_one(
+                BLOB_ID_EXISTS,
+                rusqlite::params![blob_id],
+                |_row| Ok(()),
+            ) {
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+                Err(err) => Err(std::io::Error::other(err)),
+                Ok(_) => Ok(true),
+            }
+        })
+        .await
+        .expect("blocking thread error")
+    }
+
+    /// Remove an entry (and all chunk references).
+    ///
+    /// Returns the ids of the deleted chunks' blobs so the file stores can
+    /// be removed.
+    pub async fn rm(
+        &self,
+        class: String,
+        key: String,
+    ) -> Result<Vec<[u8; 32]>> {
+        let c_write = self.c_write.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c_write = c_write.lock().unwrap();
+            let tx = c_write
+                .transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Exclusive,
+                )
+                .map_err(std::io::Error::other)?;
+            let mut out: Vec<[u8; 32]> = Vec::new();
+            for blob_id in tx
                 .prepare(
                     "
-SELECT idx, hash, nonce, tag, size, is_final
+SELECT blob_id
 FROM entry_file_chunks
 WHERE class = ?1 AND key = ?2;
             ",
                 )
                 .map_err(std::io::Error::other)?
-                .query_map(rusqlite::params![&class, &key], |row| {
-                    Ok(Chunk {
-                        idx: row.get(0)?,
-                        hash: row.get(1)?,
-                        nonce: row.get(2)?,
-                        tag: row.get(3)?,
-                        size: row.get(4)?,
-                        is_final: row.get(5)?,
-                    })
-                })
+                .query_map(rusqlite::params![&class, &key], |row| row.get(0))
                 .map_err(std::io::Error::other)?
             {
-                out.push(chunk.map_err(std::io::Error::other)?);
+                out.push(blob_id.map_err(std::io::Error::other)?);
             }
             tx.execute(
                 "
@@ -231,6 +275,50 @@ WHERE class = ?1 AND key = ?2;
             .map_err(std::io::Error::other)?;
             tx.commit().map_err(std::io::Error::other)?;
             Ok(out)
+        })
+        .await
+        .expect("blocking thread error")
+    }
+
+    /// Remove a bounded batch of entries that expired at or before
+    /// `now_micros`.
+    ///
+    /// Returns the number of entries removed alongside the ids of their
+    /// chunks' blobs so the file stores can be removed. A return count equal
+    /// to `limit` means there may be more expired entries waiting.
+    pub async fn prune_expired(
+        &self,
+        now_micros: i64,
+        limit: i64,
+    ) -> Result<(usize, Vec<[u8; 32]>)> {
+        let c_write = self.c_write.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c_write = c_write.lock().unwrap();
+            let tx = c_write
+                .transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Exclusive,
+                )
+                .map_err(std::io::Error::other)?;
+
+            let mut blob_ids: Vec<[u8; 32]> = Vec::new();
+            for blob_id in tx
+                .prepare(PRUNE_EXPIRED_BLOB_IDS)
+                .map_err(std::io::Error::other)?
+                .query_map(rusqlite::params![now_micros, limit], |row| {
+                    row.get(0)
+                })
+                .map_err(std::io::Error::other)?
+            {
+                blob_ids.push(blob_id.map_err(std::io::Error::other)?);
+            }
+
+            let count = tx
+                .execute(PRUNE_EXPIRED, rusqlite::params![now_micros, limit])
+                .map_err(std::io::Error::other)?;
+
+            tx.commit().map_err(std::io::Error::other)?;
+
+            Ok((count, blob_ids))
         })
         .await
         .expect("blocking thread error")
@@ -286,12 +374,11 @@ WHERE class = ?1 AND key = ?2;
                 rusqlite::params![class, key, idx],
                 |row| {
                     Ok(Chunk {
-                        idx: row.get(0)?,
-                        hash: row.get(1)?,
-                        nonce: row.get(2)?,
-                        tag: row.get(3)?,
-                        size: row.get(4)?,
-                        is_final: row.get(5)?,
+                        hash: row.get(0)?,
+                        nonce: row.get(1)?,
+                        tag: row.get(2)?,
+                        size: row.get(3)?,
+                        is_final: row.get(4)?,
                     })
                 },
             ) {
@@ -426,9 +513,6 @@ WHERE class = ?1"
 
 /// A database entry file chunk.
 pub struct Chunk {
-    /// chunk index
-    pub idx: i64,
-
     /// sha256 hash of chunk content
     pub hash: [u8; 32],
 

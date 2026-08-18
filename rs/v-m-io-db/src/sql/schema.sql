@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS entry_file_chunks (
   class TEXT NOT NULL,
   key TEXT NOT NULL,
   idx INTEGER NOT NULL,
+  -- identifies the blob file backing this chunk, derived from
+  -- (class, key, idx, hash). redundant, but the blob file name is the only
+  -- thing the disk cleanup task has to work from, so it needs to be
+  -- indexed to answer "is this file still referenced?"
+  blob_id BLOB NOT NULL,
   hash BLOB NOT NULL,
   nonce BLOB NOT NULL,
   tag BLOB NOT NULL,
@@ -28,3 +33,6 @@ CREATE TABLE IF NOT EXISTS entry_file_chunks (
     ON DELETE CASCADE
     ON UPDATE CASCADE
 ) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS entry_file_chunks_blob_id_idx
+  ON entry_file_chunks (blob_id);
