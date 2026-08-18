@@ -3,6 +3,7 @@
 
 use sha2::Digest;
 use std::io::Result;
+use std::sync::Arc;
 
 mod blob;
 mod sql;
@@ -64,8 +65,34 @@ pub enum VmIoDbListSort {
 /// v-m.io all service runtime database
 pub struct VmIoDb {
     root_dir: std::path::PathBuf,
-    sql: sql::Sql,
+    sql: Arc<sql::Sql>,
     encryption_key: zeroize::Zeroizing<[u8; 32]>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for VmIoDb {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn cleanup_task(
+    root_dir: std::path::PathBuf,
+    sql: Arc<sql::Sql>,
+    encryption_key: zeroize::Zeroizing<[u8; 32]>,
+) {
+    loop {
+        // TODO - loop over hash files, checking for references in sql,
+        //        (add hash index to sql??)
+        //        any unreferenced files with system modified times
+        //        > 1 minute should be safe to delete
+
+        // TODO - walk the directory (part of same loop above??) any
+        //        empty hash directory with a modified time > 1 minute
+        //        should be safe to remove
+
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 10)).await;
+    }
 }
 
 impl VmIoDb {
@@ -80,15 +107,21 @@ impl VmIoDb {
         let mut sql_path = root_dir.clone();
         sql_path.push("db.sqlite");
 
-        let sql = sql::Sql::new(sql_path, encryption_key.clone()).await?;
+        let sql =
+            Arc::new(sql::Sql::new(sql_path, encryption_key.clone()).await?);
 
-        // TODO - set up a background task to slowly remove orphan files
-        //        and clean up empty hash directories
+        let task = tokio::task::spawn(cleanup_task(
+            root_dir.clone(),
+            sql.clone(),
+            encryption_key.clone(),
+        ))
+        .abort_handle();
 
         Ok(Self {
             root_dir,
             sql,
             encryption_key: encryption_key.into(),
+            task,
         })
     }
 
@@ -155,9 +188,10 @@ impl VmIoDb {
 
         let path = blob::gen_path(&self.root_dir, &class, &key, idx, &hash);
         tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-        tokio::fs::write(path, &data).await?;
+        tokio::fs::write(&path, &data).await?;
 
-        self.sql
+        match self
+            .sql
             .upsert_chunk(
                 class,
                 key,
@@ -168,11 +202,18 @@ impl VmIoDb {
                 data.len() as i64,
                 is_final,
             )
-            .await?;
-        // question: do we want to delete file on error of the upsert?
-        // question: if upsert was update do we want to delete old file?
-
-        Ok(())
+            .await
+        {
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                Err(err)
+            }
+            Ok(_) => {
+                // TODO - upsert_chunk should return the old hash
+                //        if it was replaced so we can delete it here
+                Ok(())
+            }
+        }
     }
 
     /// Remove an entry.
@@ -187,7 +228,6 @@ impl VmIoDb {
                 &chunk.hash,
             );
             tokio::fs::remove_file(path).await?;
-            // question: do we want to proactively clean up empty hash dirs?
         }
         Ok(())
     }
