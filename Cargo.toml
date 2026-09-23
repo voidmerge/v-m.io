@@ -3,6 +3,7 @@ members = [
   "rs/v-m-io-back",
   "rs/v-m-io-db",
   "rs/v-m-io-types",
+  "rs/v-m-io-chan",
 ]
 resolver = "3"
 
@@ -30,6 +31,7 @@ turso = "0.7.2"
 lru = "0.18"
 mlua = "0.12"
 rand = "0.10.2"
+reqwest = "0.13.5"
 rusqlite = "0.40.2"
 serde = "1.0.229"
 sha2 = "0.11"

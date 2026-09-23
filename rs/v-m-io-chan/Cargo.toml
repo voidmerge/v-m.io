@@ -1,0 +1,23 @@
+[package]
+name = "v-m-io-chan"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+description = "v-m.io communication channel"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/v-m-io-chan"
+repository = "https://github.com/voidmerge/v-m.io"
+keywords = [ "p2p" ]
+categories = [ "network-programming" ]
+
+[dependencies]
+bincode-next = { workspace = true, features = ["serde"] }
+futures-util = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["server", "server-auto", "tokio"] }
+http-body-util = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true, features = ["net"] }
+reqwest = { workspace = true }
