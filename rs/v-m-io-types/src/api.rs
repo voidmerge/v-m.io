@@ -17,8 +17,7 @@ pub fn encode<E>(e: &E) -> std::io::Result<Vec<u8>>
 where
     E: std::fmt::Debug + serde::Serialize,
 {
-    bincode_next::serde::encode_to_vec(e, CONFIG)
-        .map_err(std::io::Error::other)
+    bincode_next::serde::encode_to_vec(e, CONFIG).map_err(std::io::Error::other)
 }
 
 /// Decode from bytes.

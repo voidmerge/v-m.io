@@ -267,14 +267,22 @@ async fn serve_connection(
 }
 
 /// Accept connections forever, spawning a task per connection.
+///
+/// Connections are tracked in a local [tokio::task::JoinSet] so that aborting
+/// this accept loop (for example when [ChanSrv] is dropped) also aborts any
+/// connections it spawned.
 async fn accept_loop(
     listener: TcpListener,
     inner: Arc<SrvInner>,
     sem: Arc<Semaphore>,
 ) {
     let mut stream = TcpListenerStream::new(listener);
+    let mut conns = tokio::task::JoinSet::new();
 
     while let Some(conn) = stream.next().await {
+        // Reap any connections that have already finished.
+        while conns.try_join_next().is_some() {}
+
         let stream = match conn {
             Ok(stream) => stream,
             Err(_) => continue,
@@ -284,7 +292,7 @@ async fn accept_loop(
         let inner = inner.clone();
         let sem = sem.clone();
 
-        tokio::task::spawn(async move {
+        conns.spawn(async move {
             serve_connection(io, inner, sem).await;
         });
     }
@@ -303,9 +311,11 @@ pub struct ChanSrvConfig {
 }
 
 /// v-m.io channel server
+///
+/// Dropping the server aborts its accept loops and all in-flight connections.
 pub struct ChanSrv {
     local_addrs: Vec<std::net::SocketAddr>,
-    _tasks: Vec<tokio::task::JoinHandle<()>>,
+    _tasks: tokio::task::JoinSet<()>,
 }
 
 impl ChanSrv {
@@ -343,12 +353,12 @@ impl ChanSrv {
             .collect::<Result<Vec<_>>>()?;
 
         let sem = Arc::new(Semaphore::new(MAX_CONNS));
-        let mut tasks = Vec::with_capacity(listeners.len());
+        let mut tasks = tokio::task::JoinSet::new();
 
         for listener in listeners {
             let inner = inner.clone();
             let sem = sem.clone();
-            tasks.push(tokio::task::spawn(accept_loop(listener, inner, sem)));
+            tasks.spawn(accept_loop(listener, inner, sem));
         }
 
         Ok(Self {
@@ -678,5 +688,28 @@ mod tests {
         };
 
         assert!(ChanSrv::new(config).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn drop_shuts_down_server() {
+        let (srv, addr) =
+            start(vec![handler(Echo)], auth_eq("Bearer test")).await;
+
+        let cli = ChanCli::connect(addr, "Bearer test".to_string())
+            .await
+            .unwrap();
+        assert!(cli.request("echo", b"x".to_vec()).await.is_ok());
+
+        drop(srv);
+
+        // Give the runtime a moment to abort the accept loop and release
+        // the listening socket.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            ChanCli::connect(addr, "Bearer test".to_string())
+                .await
+                .is_err()
+        );
     }
 }

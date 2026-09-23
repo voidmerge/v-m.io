@@ -1,0 +1,19 @@
+[package]
+name = "v-m-io-cfg"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+description = "v-m.io config server"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/v-m-io-cfg"
+repository = "https://github.com/voidmerge/v-m.io"
+keywords = [ "p2p", "verify", "verifiable" ]
+categories = [ "database", "database-implementations", "network-programming", "web-programming" ]
+
+[dependencies]
+clap = { workspace = true, features = ["derive", "env", "wrap_help"] }
+tokio = { workspace = true, features = ["full"] }
+v-m-io-chan = { workspace = true }
+v-m-io-db = { workspace = true }
+v-m-io-types = { workspace = true }
