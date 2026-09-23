@@ -1,6 +1,8 @@
 #![deny(missing_docs)]
 //! v-m.io chan
 
+pub mod cfg;
+
 use std::collections::HashMap;
 use std::io::Result;
 use std::sync::Arc;

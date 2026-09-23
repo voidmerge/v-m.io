@@ -1848,15 +1848,14 @@ dependencies = [
 name = "v-m-io-chan"
 version = "0.0.1"
 dependencies = [
- "bincode-next",
  "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
  "reqwest",
- "serde",
  "tokio",
  "tokio-stream",
+ "v-m-io-types",
 ]
 
 [[package]]
@@ -1879,13 +1878,7 @@ name = "v-m-io-types"
 version = "0.0.1"
 dependencies = [
  "bincode-next",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
  "serde",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
