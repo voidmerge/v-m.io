@@ -177,10 +177,6 @@ async fn read_all(db: &VmIoDb) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        if entry.key.starts_with(CFG_API_KEY_PREFIX) {
-            continue;
-        }
-
         let value = match entry.metadata {
             Some(metadata) => String::from_utf8(metadata).map_err(|_| {
                 std::io::Error::other("config value is not valid utf-8")
@@ -254,6 +250,7 @@ fn make_auth_cb(db: Arc<VmIoDb>) -> DynAuthCb {
                 auth.strip_prefix("Bearer ").unwrap_or(auth.as_str()).trim();
 
             if token.is_empty() {
+                tracing::warn!("authentication failed: missing bearer token");
                 return Ok(hyper::StatusCode::UNAUTHORIZED);
             }
 
@@ -261,8 +258,14 @@ fn make_auth_cb(db: Arc<VmIoDb>) -> DynAuthCb {
 
             match db.get(CFG_CLASS.to_string(), key).await {
                 Ok(Some(_)) => Ok(hyper::StatusCode::OK),
-                Ok(None) => Ok(hyper::StatusCode::UNAUTHORIZED),
-                Err(_) => Ok(hyper::StatusCode::INTERNAL_SERVER_ERROR),
+                Ok(None) => {
+                    tracing::warn!("authentication failed: unknown api key");
+                    Ok(hyper::StatusCode::UNAUTHORIZED)
+                }
+                Err(err) => {
+                    tracing::warn!("authentication error: api key lookup failed: {err}");
+                    Ok(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                }
             }
         })
     })
@@ -321,12 +324,18 @@ pub async fn config_srv(config: &Config) -> Result<ChanSrv> {
         }),
     ];
 
-    ChanSrv::new(ChanSrvConfig {
+    let srv = ChanSrv::new(ChanSrvConfig {
         auth_cb: make_auth_cb(db),
         handlers,
         bind: config.addr.clone(),
     })
-    .await
+    .await?;
+
+    for addr in srv.local_addrs() {
+        tracing::info!("config server listening on {addr}");
+    }
+
+    Ok(srv)
 }
 
 /// Run the config server.
