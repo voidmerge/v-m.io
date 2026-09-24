@@ -11,11 +11,11 @@ use v_m_io_chan::cfg::ChanCliCfgExt;
 #[command(version, about, long_about = None)]
 pub struct Config {
     /// V-m.io server address.
-    #[arg(long, env = "V_M_IO_ADDR")]
+    #[arg(long, env = "V_M_IO_ADDR", default_value = "127.0.0.1:44332")]
     pub addr: std::net::SocketAddr,
 
     /// Api token allowing access.
-    #[arg(long, env = "V_M_IO_API_KEY")]
+    #[arg(long, env = "V_M_IO_API_KEY", default_value = "test")]
     pub api_key: String,
 
     #[command(subcommand)]
@@ -47,7 +47,9 @@ pub async fn client_run(config: Config) -> Result<()> {
         Cmd::Health => health(config).await,
         Cmd::CfgGet => {
             let cfg = cfg_get(config).await?.map_err(std::io::Error::other)?;
-            println!("{cfg:#?}");
+            let cfg: std::collections::HashMap<String, String> =
+                cfg.into_iter().collect();
+            println!("{}", serde_json::to_string_pretty(&cfg)?);
             Ok(())
         }
         Cmd::CfgPut { key, value } => cfg_put(config, key, value).await,

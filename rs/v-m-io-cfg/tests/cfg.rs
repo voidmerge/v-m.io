@@ -23,7 +23,8 @@ fn config(dir: &Path, init: Option<String>) -> Config {
         db_root_dir: dir.to_string_lossy().into_owned(),
         addr: vec!["127.0.0.1:0".parse().unwrap()],
         init,
-        encryption_key: b64_key(),
+        encryption_key: Some(b64_key()),
+        test: false,
     }
 }
 
@@ -204,7 +205,10 @@ async fn values_persist_across_restart() {
     let cli = client(addr).await;
 
     assert_eq!(
-        vec![api_key_entry(), ("persisted".to_string(), "yes".to_string())],
+        vec![
+            api_key_entry(),
+            ("persisted".to_string(), "yes".to_string())
+        ],
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
 }
@@ -277,4 +281,78 @@ async fn server_requires_auth() {
         .unwrap();
 
     assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_defaults_seed_api_key_and_bind() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = Config {
+        db_root_dir: ".".to_string(),
+        addr: vec!["0.0.0.0:0".parse().unwrap()],
+        init: None,
+        encryption_key: None,
+        test: true,
+    };
+
+    cfg.apply_test_defaults(dir.path().to_path_buf()).unwrap();
+
+    assert_eq!(cfg.db_root_dir, dir.path().to_string_lossy());
+    assert_eq!(cfg.addr, vec!["127.0.0.1:44332".parse().unwrap()]);
+
+    // the test encryption key default allows initialization without an
+    // explicit --encryption-key
+    config_init(&cfg).await.unwrap();
+
+    // serve on an ephemeral port and authenticate with the seeded test key
+    cfg.init = None;
+    cfg.addr = vec!["127.0.0.1:0".parse().unwrap()];
+
+    let srv = config_srv(&cfg).await.unwrap();
+    let addr = srv.local_addrs()[0];
+    let cli = ChanCli::connect(addr, "Bearer test".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        vec![("cfg-api-key~test".to_string(), String::new())],
+        cli.cfg_get(()).await.unwrap().unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn test_defaults_preserve_explicit_addr_and_init() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = Config {
+        db_root_dir: ".".to_string(),
+        addr: vec!["127.0.0.1:12345".parse().unwrap()],
+        init: Some(serde_json::json!({ "public": "value" }).to_string()),
+        encryption_key: None,
+        test: true,
+    };
+
+    cfg.apply_test_defaults(dir.path().to_path_buf()).unwrap();
+
+    // an explicit --addr wins over the test default
+    assert_eq!(cfg.addr, vec!["127.0.0.1:12345".parse().unwrap()]);
+
+    config_init(&cfg).await.unwrap();
+    cfg.init = None;
+    cfg.addr = vec!["127.0.0.1:0".parse().unwrap()];
+
+    let srv = config_srv(&cfg).await.unwrap();
+    let addr = srv.local_addrs()[0];
+    let cli = ChanCli::connect(addr, "Bearer test".to_string())
+        .await
+        .unwrap();
+
+    // both the seeded api key and the user-provided init value are present
+    assert_eq!(
+        vec![
+            ("cfg-api-key~test".to_string(), String::new()),
+            ("public".to_string(), "value".to_string()),
+        ],
+        cli.cfg_get(()).await.unwrap().unwrap(),
+    );
 }

@@ -2,6 +2,7 @@
 //! v-m.io cfg
 
 use std::io::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -38,8 +39,20 @@ pub struct Config {
     pub init: Option<String>,
 
     /// Base64 Encryption key (32 bytes) for at-rest db encryption.
+    ///
+    /// If not provided, a random ephemeral key is generated. Data persisted
+    /// under a random key is not readable after a restart.
     #[arg(long, env = "V_M_IO_CFG_ENCRYPTION_KEY")]
-    pub encryption_key: String,
+    pub encryption_key: Option<String>,
+
+    /// Run in test mode.
+    ///
+    /// A temporary directory is used as the database root, the server binds
+    /// `127.0.0.1:44332` (unless an explicit `--addr` is given), and a
+    /// default `test` api key is seeded into the kv store. The temporary
+    /// directory is removed, best effort, when the process exits.
+    #[arg(long, env = "V_M_IO_CFG_TEST")]
+    pub test: bool,
 }
 
 /// The db class under which all config entries are stored.
@@ -63,6 +76,16 @@ const CFG_GET_REQ: &str = "cfg-get";
 
 /// The request name of the config setter, matching `ChanCliCfgExt::cfg_put`.
 const CFG_PUT_REQ: &str = "cfg-put";
+
+/// The default `--addr` value, used to detect whether the caller explicitly
+/// supplied a bind address.
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:0";
+
+/// The bind address used in `--test` mode when no explicit `--addr` is given.
+const TEST_BIND_ADDR: &str = "127.0.0.1:44332";
+
+/// The api key seeded into the kv store in `--test` mode.
+const TEST_API_KEY: &str = "test";
 
 /// Current unix epoch timestamp in microseconds.
 fn unix_micros() -> i64 {
@@ -110,6 +133,102 @@ fn parse_encryption_key(key: &str) -> Result<[u8; 32]> {
             "encryption key must decode to exactly 32 bytes",
         )
     })
+}
+
+/// Encode raw key bytes as a standard base64 string.
+fn encode_encryption_key(key: &[u8; 32]) -> String {
+    use base64::Engine;
+
+    base64::engine::general_purpose::STANDARD.encode(key)
+}
+
+/// Generate a random 32 byte master key.
+fn random_encryption_key() -> [u8; 32] {
+    use rand::Rng;
+
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    key
+}
+
+/// Resolve the raw master key for `config`.
+///
+/// If no key was configured, a random ephemeral key is generated. Data
+/// written under a random key cannot be read after a restart, so a stable
+/// `--encryption-key` is required to persist data across runs.
+fn resolve_encryption_key(config: &Config) -> Result<[u8; 32]> {
+    match config.encryption_key.as_deref() {
+        Some(key) if !key.is_empty() => parse_encryption_key(key),
+        _ => {
+            tracing::warn!(
+                "no --encryption-key provided; generated a random ephemeral \
+                 key (persisted data will not be readable on restart)",
+            );
+            Ok(random_encryption_key())
+        }
+    }
+}
+
+impl Config {
+    /// Apply the `--test` convenience defaults in place.
+    ///
+    /// `root` becomes the database root, the default `test` api key is merged
+    /// into the `init` values (seeding it on the next
+    /// [`config_init`]/[`config_srv`] call), and the server binds
+    /// `127.0.0.1:44332` unless an explicit `--addr` was supplied. If no
+    /// encryption key is configured, a random one is pinned so that
+    /// initialization and serving use the same key.
+    ///
+    /// The caller is responsible for removing `root` when done.
+    pub fn apply_test_defaults(&mut self, root: PathBuf) -> Result<()> {
+        self.db_root_dir = root.to_string_lossy().into_owned();
+
+        let default_addr: std::net::SocketAddr = DEFAULT_BIND_ADDR
+            .parse()
+            .expect("valid default bind address");
+
+        // `addr` is empty when `--addr` is passed with no values
+        if self.addr.is_empty() || self.addr == [default_addr] {
+            self.addr =
+                vec![TEST_BIND_ADDR.parse().expect("valid test bind address")];
+        }
+
+        let mut init: std::collections::BTreeMap<String, String> =
+            match self.init.as_deref() {
+                Some(init) => serde_json::from_str(init).map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid --init json: {err}"),
+                    )
+                })?,
+                None => std::collections::BTreeMap::new(),
+            };
+
+        init.insert(
+            format!("{CFG_API_KEY_PREFIX}{TEST_API_KEY}"),
+            String::new(),
+        );
+
+        self.init = Some(serde_json::to_string(&init).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("failed to encode init json: {err}"),
+            )
+        })?);
+
+        // pin a single random key so initialization and serving agree when no
+        // explicit key was provided
+        if self
+            .encryption_key
+            .as_deref()
+            .is_none_or(|key| key.is_empty())
+        {
+            self.encryption_key =
+                Some(encode_encryption_key(&random_encryption_key()));
+        }
+
+        Ok(())
+    }
 }
 
 /// Upsert a single config value, retrying on a timestamp collision.
@@ -291,7 +410,7 @@ pub async fn config_init(config: &Config) -> Result<()> {
 
     let db = VmIoDb::new(
         config.db_root_dir.as_str(),
-        parse_encryption_key(&config.encryption_key)?.into(),
+        resolve_encryption_key(config)?.into(),
     )
     .await?;
 
@@ -311,7 +430,7 @@ pub async fn config_srv(config: &Config) -> Result<ChanSrv> {
     let db = Arc::new(
         VmIoDb::new(
             config.db_root_dir.as_str(),
-            parse_encryption_key(&config.encryption_key)?.into(),
+            resolve_encryption_key(config)?.into(),
         )
         .await?,
     );
@@ -342,10 +461,20 @@ pub async fn config_srv(config: &Config) -> Result<ChanSrv> {
 
 /// Run the config server.
 ///
-/// If `config.init` is set, the database is initialized (or overwritten) and
-/// the function returns without serving. Otherwise the server runs until the
-/// process exits.
+/// If `config.test` is set, the server runs in test mode: a temporary
+/// directory is used as the database root, a default `test` api key is
+/// seeded, and the server binds `127.0.0.1:44332` unless an explicit `--addr`
+/// was given. The temporary directory is removed, best effort, when a
+/// shutdown signal (ctrl-c or SIGTERM) is received.
+///
+/// Otherwise, if `config.init` is set, the database is initialized (or
+/// overwritten) and the function returns without serving. Otherwise the
+/// server runs until the process exits.
 pub async fn config_run(config: Config) -> Result<()> {
+    if config.test {
+        return config_run_test(config).await;
+    }
+
     if config.init.is_some() {
         return config_init(&config).await;
     }
@@ -356,4 +485,71 @@ pub async fn config_run(config: Config) -> Result<()> {
     std::future::pending::<()>().await;
 
     Ok(())
+}
+
+/// Run the config server in `--test` mode.
+///
+/// Uses a freshly created temporary directory as the database root, seeds a
+/// default [`TEST_API_KEY`] api key, and serves until a shutdown signal is
+/// received. The temporary directory is removed, best effort, before
+/// returning.
+async fn config_run_test(mut config: Config) -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+
+    tracing::warn!(
+        "--test mode: using temporary db root {}",
+        tmp.path().display(),
+    );
+
+    config.apply_test_defaults(tmp.path().to_path_buf())?;
+
+    // initialize (or overwrite) the database, seeding the test api key
+    config_init(&config).await?;
+
+    // now serve from the initialized database
+    config.init = None;
+    let srv = config_srv(&config).await?;
+
+    for addr in srv.local_addrs() {
+        tracing::warn!(
+            "--test mode: listening on {addr} (api key: \"{TEST_API_KEY}\")",
+        );
+    }
+
+    // wait for a graceful shutdown so we can clean up the temp dir
+    wait_for_shutdown().await;
+
+    // drop the server (closing the db) before removing the directory
+    drop(srv);
+    drop(tmp);
+
+    Ok(())
+}
+
+/// Resolve once the process receives a shutdown signal.
+///
+/// Listens for ctrl-c, and additionally SIGTERM on unix.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!("failed to install SIGTERM handler: {err}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
