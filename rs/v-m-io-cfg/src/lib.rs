@@ -237,6 +237,7 @@ async fn upsert_value(
     counter: &AtomicI64,
     key: String,
     value: String,
+    expires_at_micros: Option<i64>,
 ) -> Result<()> {
     if key.len() > CFG_KEY_MAX {
         return Err(std::io::Error::new(
@@ -265,7 +266,7 @@ async fn upsert_value(
                 CFG_CLASS.to_string(),
                 key.clone(),
                 modified_at_micros,
-                None,
+                expires_at_micros,
                 Some(metadata.clone()),
             )
             .await
@@ -344,11 +345,22 @@ impl ChanHandler for CfgPutHandler {
 
     fn handle(&self, req: Vec<u8>) -> BoxFut<'_, Result<Vec<u8>>> {
         Box::pin(async move {
-            let (key, value): CfgPutReq = decode(&req)?;
+            let CfgPutReq {
+                key,
+                value,
+                expires_at_micros,
+            } = decode(&req)?;
 
             // api keys may be pushed through the same interface as any other
             // config value
-            upsert_value(&self.db, &self.counter, key, value).await?;
+            upsert_value(
+                &self.db,
+                &self.counter,
+                key,
+                value,
+                expires_at_micros,
+            )
+            .await?;
 
             // CfgPutRes is the unit type: an empty response body
             Ok(Vec::new())
@@ -416,8 +428,9 @@ pub async fn config_init(config: &Config) -> Result<()> {
 
     let counter = AtomicI64::new(0);
 
+    // init values never expire; expiries can only be set through `cfg-put`
     for (key, value) in values {
-        upsert_value(&db, &counter, key, value).await?;
+        upsert_value(&db, &counter, key, value, None).await?;
     }
 
     Ok(())

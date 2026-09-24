@@ -5,6 +5,7 @@ use std::io::Result;
 
 use v_m_io_chan::ChanCli;
 use v_m_io_chan::cfg::ChanCliCfgExt;
+use v_m_io_types::api::CfgPutReq;
 
 /// Configure how to invoke the v-m.io client.
 #[derive(Debug, clap::Parser)]
@@ -29,7 +30,12 @@ enum Cmd {
     Health,
 
     /// Dump the full config.
-    CfgGet,
+    CfgGet {
+        /// Normally removed (tombstoned) values are hidden.
+        /// Use this flag to also show tombstoned values.
+        #[arg(long)]
+        show_tombstones: bool,
+    },
 
     /// Write an entry to the config.
     CfgPut {
@@ -37,6 +43,20 @@ enum Cmd {
         key: String,
         /// The config entry value.
         value: String,
+        /// Optional expiration time as a unix epoch timestamp in microseconds.
+        #[arg(long)]
+        expires_at_micros: Option<i64>,
+    },
+
+    /// Delete (tombstone) an entry from the config.
+    CfgRm {
+        /// The config entry key.
+        key: String,
+
+        /// Expiration time as a unix epoch timestamp in microseconds.
+        /// If not specified, will be set 30 days from current system time.
+        #[arg(long)]
+        expires_at_micros: Option<i64>,
     },
 }
 
@@ -45,14 +65,42 @@ pub async fn client_run(config: Config) -> Result<()> {
     let cmd = config.cmd.clone();
     match cmd {
         Cmd::Health => health(config).await,
-        Cmd::CfgGet => {
+        Cmd::CfgGet { show_tombstones } => {
             let cfg = cfg_get(config).await?.map_err(std::io::Error::other)?;
-            let cfg: std::collections::HashMap<String, String> =
-                cfg.into_iter().collect();
+            let cfg: std::collections::BTreeMap<String, String> =
+                cfg.into_iter().filter(|(_k, v)| {
+                    if show_tombstones {
+                        return true;
+                    }
+                    v != v_m_io_types::api::CONFIG_TOMBSTONE
+                }).collect();
             println!("{}", serde_json::to_string_pretty(&cfg)?);
             Ok(())
         }
-        Cmd::CfgPut { key, value } => cfg_put(config, key, value).await,
+        Cmd::CfgPut {
+            key,
+            value,
+            expires_at_micros,
+        } => cfg_put(config, key, value, expires_at_micros).await,
+        Cmd::CfgRm {
+            key,
+            expires_at_micros,
+        } => {
+            let expires_at_micros = expires_at_micros.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|since| since.as_micros() as i64)
+                    .expect("system time")
+                    + 1000 * 1000 * 60 * 60 * 24 * 30
+            });
+            cfg_put(
+                config,
+                key,
+                v_m_io_types::api::CONFIG_TOMBSTONE.to_string(),
+                Some(expires_at_micros),
+            )
+            .await
+        }
     }
 }
 
@@ -74,9 +122,22 @@ pub async fn cfg_get(config: Config) -> Result<v_m_io_types::api::CfgGetRes> {
 }
 
 /// Write an entry to the config.
-pub async fn cfg_put(config: Config, key: String, value: String) -> Result<()> {
+///
+/// If `expires_at_micros` is set, the entry is stored with that expiration
+/// time (a unix epoch timestamp in microseconds).
+pub async fn cfg_put(
+    config: Config,
+    key: String,
+    value: String,
+    expires_at_micros: Option<i64>,
+) -> Result<()> {
     let cli =
         ChanCli::connect(config.addr, format!("Bearer {}", config.api_key))
             .await?;
-    cli.cfg_put((key, value)).await
+    cli.cfg_put(CfgPutReq {
+        key,
+        value,
+        expires_at_micros,
+    })
+    .await
 }

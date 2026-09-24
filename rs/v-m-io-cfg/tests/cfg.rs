@@ -8,6 +8,7 @@ use base64::Engine;
 use v_m_io_cfg::{Config, config_init, config_srv};
 use v_m_io_chan::cfg::ChanCliCfgExt;
 use v_m_io_chan::{ChanCli, ChanSrv};
+use v_m_io_types::api::CfgPutReq;
 
 /// The api key used to authorize the tests' config client.
 const API_KEY: &str = "test-api-key-1234";
@@ -59,6 +60,15 @@ fn api_key_entry() -> (String, String) {
     (format!("cfg-api-key~{API_KEY}"), String::new())
 }
 
+/// Build a `cfg-put` request with no expiration.
+fn put(key: &str, value: impl Into<String>) -> CfgPutReq {
+    CfgPutReq {
+        key: key.to_string(),
+        value: value.into(),
+        expires_at_micros: None,
+    }
+}
+
 #[tokio::test]
 async fn put_get_roundtrip_and_overwrite() {
     let dir = tempfile::tempdir().unwrap();
@@ -72,8 +82,8 @@ async fn put_get_roundtrip_and_overwrite() {
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
 
-    cli.cfg_put(("alpha".into(), "one".into())).await.unwrap();
-    cli.cfg_put(("beta".into(), "two".into())).await.unwrap();
+    cli.cfg_put(put("alpha", "one")).await.unwrap();
+    cli.cfg_put(put("beta", "two")).await.unwrap();
 
     assert_eq!(
         vec![
@@ -84,9 +94,7 @@ async fn put_get_roundtrip_and_overwrite() {
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
 
-    cli.cfg_put(("alpha".into(), "updated".into()))
-        .await
-        .unwrap();
+    cli.cfg_put(put("alpha", "updated")).await.unwrap();
 
     assert_eq!(
         vec![
@@ -106,16 +114,45 @@ async fn empty_and_unicode_values_roundtrip() {
     let (_srv, addr) = start(dir.path()).await;
     let cli = client(addr).await;
 
-    cli.cfg_put(("empty".into(), "".into())).await.unwrap();
-    cli.cfg_put(("unicode".into(), "héllo → 世界".into()))
-        .await
-        .unwrap();
+    cli.cfg_put(put("empty", "")).await.unwrap();
+    cli.cfg_put(put("unicode", "héllo → 世界")).await.unwrap();
 
     assert_eq!(
         vec![
             api_key_entry(),
             ("empty".to_string(), "".to_string()),
             ("unicode".to_string(), "héllo → 世界".to_string()),
+        ],
+        cli.cfg_get(()).await.unwrap().unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn put_with_future_expiry_is_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    init_api_key(dir.path()).await;
+
+    let (_srv, addr) = start(dir.path()).await;
+    let cli = client(addr).await;
+
+    let expires_at_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+        + 60_000_000;
+
+    cli.cfg_put(CfgPutReq {
+        key: "session".into(),
+        value: "token".into(),
+        expires_at_micros: Some(expires_at_micros),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        vec![
+            api_key_entry(),
+            ("session".to_string(), "token".to_string())
         ],
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
@@ -166,9 +203,7 @@ async fn pushed_api_key_can_authenticate() {
     let (_srv, addr) = start(dir.path()).await;
     let cli = client(addr).await;
 
-    cli.cfg_put(("cfg-api-key~second".into(), "".into()))
-        .await
-        .unwrap();
+    cli.cfg_put(put("cfg-api-key~second", "")).await.unwrap();
 
     let cli2 = ChanCli::connect(addr, "Bearer second".to_string())
         .await
@@ -193,9 +228,7 @@ async fn values_persist_across_restart() {
     {
         let (srv, addr) = start(dir.path()).await;
         let cli = client(addr).await;
-        cli.cfg_put(("persisted".into(), "yes".into()))
-            .await
-            .unwrap();
+        cli.cfg_put(put("persisted", "yes")).await.unwrap();
 
         drop(srv);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -221,7 +254,7 @@ async fn init_overwrites_existing_values() {
     {
         let (srv, addr) = start(dir.path()).await;
         let cli = client(addr).await;
-        cli.cfg_put(("k".into(), "old".into())).await.unwrap();
+        cli.cfg_put(put("k", "old")).await.unwrap();
 
         drop(srv);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -255,7 +288,7 @@ async fn oversized_value_is_rejected() {
 
     let big = "x".repeat(4097);
 
-    assert!(cli.cfg_put(("big".into(), big)).await.is_err());
+    assert!(cli.cfg_put(put("big", big)).await.is_err());
 
     // the rejected write must not have landed
     assert_eq!(

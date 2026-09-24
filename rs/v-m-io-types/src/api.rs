@@ -3,6 +3,9 @@
 const CONFIG: bincode_next::config::Configuration =
     bincode_next::config::standard();
 
+/// Config value tombstone marker.
+pub const CONFIG_TOMBSTONE: &str = "\x1f[[::TOMBSTONE::]]\x04";
+
 // ## WARNING - CRITICAL ##
 //
 // We're using bincode here, which doesn't use tags...
@@ -37,7 +40,18 @@ pub type CfgGetReq = ();
 pub type CfgGetRes = Result<Vec<(String, String)>, String>;
 
 /// `cfg-put` request payload.
-pub type CfgPutReq = (String, String);
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CfgPutReq {
+    /// The config entry key.
+    pub key: String,
+    /// The config entry value.
+    pub value: String,
+    /// Optional expiration time, as a unix epoch timestamp in microseconds.
+    ///
+    /// `None` leaves the entry without an expiry.
+    #[serde(default)]
+    pub expires_at_micros: Option<i64>,
+}
 
 /// `cfg-put` response payload.
 pub type CfgPutRes = ();
