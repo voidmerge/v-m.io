@@ -16,6 +16,7 @@ futures-util = { workspace = true }
 hyper = { workspace = true, features = ["server"] }
 hyper-util = { workspace = true, features = ["server", "server-auto", "tokio"] }
 http-body-util = { workspace = true }
+network-interface = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true, features = ["net"] }
 reqwest = { workspace = true }

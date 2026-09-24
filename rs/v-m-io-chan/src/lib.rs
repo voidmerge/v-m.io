@@ -15,6 +15,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -298,6 +299,88 @@ async fn accept_loop(
     }
 }
 
+/// Returns true if `ip` is a link-local address (`169.254.0.0/16` for IPv4,
+/// `fe80::/10` for IPv6), which is not routable and so should not be
+/// advertised or bound to.
+fn is_link_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            a == 169 && b == 254
+        }
+        std::net::IpAddr::V6(ip) => {
+            let [a, b, ..] = ip.octets();
+            a == 0xfe && (b & 0xc0) == 0x80
+        }
+    }
+}
+
+/// Expand any unspecified (`0.0.0.0` / `::`) bind address into the concrete
+/// routable addresses of the local interfaces it covers.
+///
+/// Binding the wildcard address means "listen on every interface", but then
+/// [ChanSrv::local_addrs] can only report the wildcard, which is not a
+/// routable address a peer could connect to. Instead we resolve the wildcard
+/// to each routable address currently assigned to a non-internal interface of
+/// the matching address family. Loopback and link-local addresses are
+/// skipped. When no such address exists for a family, the original wildcard
+/// is retained so binding still succeeds.
+fn expand_bind_addrs(
+    bind: Vec<std::net::SocketAddr>,
+    ifaces: &[NetworkInterface],
+) -> Vec<std::net::SocketAddr> {
+    let mut out = Vec::with_capacity(bind.len());
+
+    for addr in bind {
+        if !addr.ip().is_unspecified() {
+            out.push(addr);
+            continue;
+        }
+
+        let want_v4 = addr.is_ipv4();
+        let mut found = false;
+
+        for iface in ifaces {
+            if iface.internal {
+                continue;
+            }
+
+            for if_addr in &iface.addr {
+                let ip = if_addr.ip();
+                if ip.is_ipv4() != want_v4
+                    || ip.is_loopback()
+                    || is_link_local(ip)
+                {
+                    continue;
+                }
+
+                out.push(std::net::SocketAddr::new(ip, addr.port()));
+                found = true;
+            }
+        }
+
+        if !found {
+            out.push(addr);
+        }
+    }
+
+    out
+}
+
+/// Resolve a configured bind list, expanding unspecified addresses into the
+/// routable addresses of the local interfaces.
+fn resolve_bind_addrs(
+    bind: Vec<std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>> {
+    if !bind.iter().any(|addr| addr.ip().is_unspecified()) {
+        return Ok(bind);
+    }
+
+    let ifaces = NetworkInterface::show().map_err(std::io::Error::other)?;
+
+    Ok(expand_bind_addrs(bind, &ifaces))
+}
+
 /// Configuration for a chan server.
 pub struct ChanSrvConfig {
     /// Authorization callback.
@@ -342,8 +425,10 @@ impl ChanSrv {
             handlers,
         });
 
+        let bind = resolve_bind_addrs(config.bind)?;
+
         let listeners = futures_util::future::try_join_all(
-            config.bind.into_iter().map(TcpListener::bind),
+            bind.into_iter().map(TcpListener::bind),
         )
         .await?;
 
@@ -490,6 +575,72 @@ mod tests {
         handler: T,
     ) -> DynChanHandler {
         Arc::new(handler)
+    }
+
+    fn iface(name: &str, ip: &str, internal: bool) -> NetworkInterface {
+        let ip: std::net::Ipv4Addr = ip.parse().unwrap();
+        NetworkInterface::new_afinet(name, ip, None, None, 0, internal)
+    }
+
+    fn iface6(name: &str, ip: &str, internal: bool) -> NetworkInterface {
+        let ip: std::net::Ipv6Addr = ip.parse().unwrap();
+        NetworkInterface::new_afinet6(name, ip, None, None, 0, internal)
+    }
+
+    #[test]
+    fn expand_unspecified_selects_routable_ifaces() {
+        let ifaces = vec![
+            iface("lo", "127.0.0.1", true),
+            iface("eth0", "169.254.1.2", false),
+            iface("eth1", "192.168.1.10", false),
+            iface("eth2", "10.0.0.5", false),
+        ];
+
+        let out =
+            expand_bind_addrs(vec!["0.0.0.0:9000".parse().unwrap()], &ifaces);
+
+        assert_eq!(
+            out,
+            vec![
+                "192.168.1.10:9000".parse::<SocketAddr>().unwrap(),
+                "10.0.0.5:9000".parse().unwrap(),
+            ],
+        );
+    }
+
+    #[test]
+    fn expand_unspecified_matches_addr_family() {
+        let ifaces = vec![
+            iface("eth0", "192.168.1.10", false),
+            iface6("eth1", "2001:db8::5", false),
+            iface6("eth2", "fe80::1", false),
+        ];
+
+        let out =
+            expand_bind_addrs(vec!["[::]:9000".parse().unwrap()], &ifaces);
+
+        assert_eq!(
+            out,
+            vec!["[2001:db8::5]:9000".parse::<SocketAddr>().unwrap()],
+        );
+    }
+
+    #[test]
+    fn expand_unspecified_falls_back_to_wildcard() {
+        let ifaces = vec![
+            iface("lo", "127.0.0.1", true),
+            iface("eth0", "169.254.1.2", false),
+        ];
+
+        let wildcard: SocketAddr = "0.0.0.0:9000".parse().unwrap();
+        assert_eq!(expand_bind_addrs(vec![wildcard], &ifaces), vec![wildcard]);
+    }
+
+    #[test]
+    fn expand_keeps_concrete_addrs() {
+        let ifaces = vec![iface("eth0", "192.168.1.10", false)];
+        let concrete: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        assert_eq!(expand_bind_addrs(vec![concrete], &ifaces), vec![concrete],);
     }
 
     fn auth_eq(expected: &'static str) -> DynAuthCb {

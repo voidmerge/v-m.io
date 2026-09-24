@@ -5,9 +5,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use base64::Engine;
-use v_m_io_cfg::{Config, config_init, config_srv};
+use v_m_io_cfg::{CfgSrv, Config, config_init, config_srv};
+use v_m_io_chan::ChanCli;
 use v_m_io_chan::cfg::ChanCliCfgExt;
-use v_m_io_chan::{ChanCli, ChanSrv};
 use v_m_io_types::api::CfgPutReq;
 
 /// The api key used to authorize the tests' config client.
@@ -41,7 +41,7 @@ async fn init_api_key(dir: &Path) {
 }
 
 /// Start a config server on an ephemeral port.
-async fn start(dir: &Path) -> (ChanSrv, SocketAddr) {
+async fn start(dir: &Path) -> (CfgSrv, SocketAddr) {
     let cfg = config(dir, None);
     let srv = config_srv(&cfg).await.unwrap();
     let addr = srv.local_addrs()[0];
@@ -53,6 +53,18 @@ async fn client(addr: SocketAddr) -> ChanCli {
     ChanCli::connect(addr, format!("Bearer {API_KEY}"))
         .await
         .unwrap()
+}
+
+/// Read the full config, excluding the dynamic `cfg-addr~` bind-address
+/// advertisements, so assertions only cover user-authored config.
+async fn cfg_get_config(cli: &ChanCli) -> Vec<(String, String)> {
+    cli.cfg_get(())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with("cfg-addr~"))
+        .collect()
 }
 
 /// The `(key, value)` entry under which the tests' seeded api key is stored.
@@ -77,10 +89,7 @@ async fn put_get_roundtrip_and_overwrite() {
     let (_srv, addr) = start(dir.path()).await;
     let cli = client(addr).await;
 
-    assert_eq!(
-        vec![api_key_entry()],
-        cli.cfg_get(()).await.unwrap().unwrap(),
-    );
+    assert_eq!(vec![api_key_entry()], cfg_get_config(&cli).await,);
 
     cli.cfg_put(put("alpha", "one")).await.unwrap();
     cli.cfg_put(put("beta", "two")).await.unwrap();
@@ -91,7 +100,7 @@ async fn put_get_roundtrip_and_overwrite() {
             ("beta".to_string(), "two".to_string()),
             api_key_entry(),
         ],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 
     cli.cfg_put(put("alpha", "updated")).await.unwrap();
@@ -102,7 +111,7 @@ async fn put_get_roundtrip_and_overwrite() {
             ("beta".to_string(), "two".to_string()),
             api_key_entry(),
         ],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 }
 
@@ -123,7 +132,7 @@ async fn empty_and_unicode_values_roundtrip() {
             ("empty".to_string(), "".to_string()),
             ("unicode".to_string(), "héllo → 世界".to_string()),
         ],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 }
 
@@ -154,7 +163,7 @@ async fn put_with_future_expiry_is_returned() {
             api_key_entry(),
             ("session".to_string(), "token".to_string())
         ],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 }
 
@@ -176,7 +185,7 @@ async fn api_keys_are_returned() {
 
     assert_eq!(
         vec![api_key_entry(), ("public".to_string(), "value".to_string())],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 }
 
@@ -216,7 +225,7 @@ async fn pushed_api_key_can_authenticate() {
             ("cfg-api-key~second".to_string(), String::new()),
             api_key_entry(),
         ],
-        cli2.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli2).await,
     );
 }
 
@@ -242,7 +251,7 @@ async fn values_persist_across_restart() {
             api_key_entry(),
             ("persisted".to_string(), "yes".to_string())
         ],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 }
 
@@ -274,7 +283,7 @@ async fn init_overwrites_existing_values() {
 
     assert_eq!(
         vec![api_key_entry(), ("k".to_string(), "new".to_string())],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 }
 
@@ -291,10 +300,7 @@ async fn oversized_value_is_rejected() {
     assert!(cli.cfg_put(put("big", big)).await.is_err());
 
     // the rejected write must not have landed
-    assert_eq!(
-        vec![api_key_entry()],
-        cli.cfg_get(()).await.unwrap().unwrap(),
-    );
+    assert_eq!(vec![api_key_entry()], cfg_get_config(&cli).await,);
 }
 
 #[tokio::test]
@@ -322,7 +328,7 @@ async fn test_defaults_seed_api_key_and_bind() {
 
     let mut cfg = Config {
         db_root_dir: ".".to_string(),
-        addr: vec!["0.0.0.0:0".parse().unwrap()],
+        addr: Vec::new(),
         init: None,
         encryption_key: None,
         test: true,
@@ -349,7 +355,7 @@ async fn test_defaults_seed_api_key_and_bind() {
 
     assert_eq!(
         vec![("cfg-api-key~test".to_string(), String::new())],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
 }
 
@@ -386,6 +392,65 @@ async fn test_defaults_preserve_explicit_addr_and_init() {
             ("cfg-api-key~test".to_string(), String::new()),
             ("public".to_string(), "value".to_string()),
         ],
-        cli.cfg_get(()).await.unwrap().unwrap(),
+        cfg_get_config(&cli).await,
     );
+}
+
+#[test]
+fn test_defaults_preserve_explicit_wildcard_addr() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // an explicit `0.0.0.0:0` is not the clap default any longer, so it must
+    // be preserved rather than replaced by the test bind address
+    let mut cfg = Config {
+        db_root_dir: ".".to_string(),
+        addr: vec!["0.0.0.0:0".parse().unwrap()],
+        init: None,
+        encryption_key: None,
+        test: true,
+    };
+
+    cfg.apply_test_defaults(dir.path().to_path_buf()).unwrap();
+
+    assert_eq!(cfg.addr, vec!["0.0.0.0:0".parse().unwrap()]);
+}
+
+#[test]
+fn addr_is_empty_when_not_specified_on_cli() {
+    use clap::Parser;
+
+    let none = Config::try_parse_from(["v-m-io-cfg"]).unwrap();
+    assert!(none.addr.is_empty());
+
+    let explicit =
+        Config::try_parse_from(["v-m-io-cfg", "--addr", "0.0.0.0:0"]).unwrap();
+    assert_eq!(
+        explicit.addr,
+        vec!["0.0.0.0:0".parse::<SocketAddr>().unwrap()],
+    );
+}
+
+#[tokio::test]
+async fn bound_addr_is_advertised() {
+    let dir = tempfile::tempdir().unwrap();
+    init_api_key(dir.path()).await;
+
+    let (_srv, addr) = start(dir.path()).await;
+    let cli = client(addr).await;
+
+    let expected = format!("cfg-addr~{addr}");
+
+    // the advertisement task runs as soon as the server starts; poll briefly
+    // rather than assuming it has been scheduled by now
+    let mut found = false;
+    for _ in 0..200 {
+        let cfg = cli.cfg_get(()).await.unwrap().unwrap();
+        if cfg.iter().any(|(k, v)| *k == expected && v.is_empty()) {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(found, "bound addr {addr} was not advertised");
 }

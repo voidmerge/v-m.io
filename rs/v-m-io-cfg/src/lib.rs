@@ -22,10 +22,12 @@ pub struct Config {
 
     /// Comma-separated list of local addresses to which we should bind the
     /// server.
+    ///
+    /// If not specified, defaults to `0.0.0.0:0`, or `127.0.0.1:44332` when
+    /// `--test` is set.
     #[arg(
         long,
         env="V_M_IO_CFG_ADDR",
-        default_value="0.0.0.0:0",
         value_delimiter=',',
         num_args=0..
     )]
@@ -64,6 +66,19 @@ const CFG_CLASS: &str = "cfg";
 /// Api keys are initialized alongside regular config values, but are never
 /// returned by the config getter.
 const CFG_API_KEY_PREFIX: &str = "cfg-api-key~";
+
+/// Prefix marking a config entry as an advertised local bind address.
+const CFG_ADDR_PREFIX: &str = "cfg-addr~";
+
+/// How often the locally bound addresses are (re)advertised.
+const CFG_ADDR_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// How long an advertised bind address remains valid.
+///
+/// Twice the advertisement interval, so an entry stays valid across a single
+/// missed refresh before the db prunes it.
+const CFG_ADDR_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Maximum size of a config value, imposed by the entry metadata column.
 const CFG_VALUE_MAX: usize = 4096;
@@ -183,12 +198,10 @@ impl Config {
     pub fn apply_test_defaults(&mut self, root: PathBuf) -> Result<()> {
         self.db_root_dir = root.to_string_lossy().into_owned();
 
-        let default_addr: std::net::SocketAddr = DEFAULT_BIND_ADDR
-            .parse()
-            .expect("valid default bind address");
-
-        // `addr` is empty when `--addr` is passed with no values
-        if self.addr.is_empty() || self.addr == [default_addr] {
+        // Only apply the test bind default when no `--addr` was supplied at
+        // all. An explicit `--addr 0.0.0.0:0` is preserved, and `addr` is
+        // also empty when `--addr` is passed with no values.
+        if self.addr.is_empty() {
             self.addr =
                 vec![TEST_BIND_ADDR.parse().expect("valid test bind address")];
         }
@@ -279,6 +292,47 @@ async fn upsert_value(
     Err(last_err.unwrap_or_else(|| {
         std::io::Error::other("failed to allocate a unique timestamp")
     }))
+}
+
+/// Advertise each locally bound address as a `cfg-addr~<addr>` entry with an
+/// empty value, expiring [`CFG_ADDR_TTL`] from now.
+async fn announce_addrs(
+    db: &VmIoDb,
+    counter: &AtomicI64,
+    addrs: &[std::net::SocketAddr],
+) -> Result<()> {
+    let expires_at_micros =
+        unix_micros().saturating_add(CFG_ADDR_TTL.as_micros() as i64);
+
+    for addr in addrs {
+        upsert_value(
+            db,
+            counter,
+            format!("{CFG_ADDR_PREFIX}{addr}"),
+            String::new(),
+            Some(expires_at_micros),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Periodically (re)advertise the locally bound addresses.
+///
+/// Errors are logged and retried on the next pass rather than ending the task.
+async fn announce_addrs_task(
+    db: Arc<VmIoDb>,
+    counter: Arc<AtomicI64>,
+    addrs: Vec<std::net::SocketAddr>,
+) {
+    loop {
+        if let Err(err) = announce_addrs(&db, &counter, &addrs).await {
+            tracing::warn!("failed to advertise config server addrs: {err}");
+        }
+
+        tokio::time::sleep(CFG_ADDR_INTERVAL).await;
+    }
 }
 
 /// Read every regular config value, excluding api keys.
@@ -436,10 +490,29 @@ pub async fn config_init(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// A running config server.
+///
+/// Dropping this aborts the address advertisement task in addition to the
+/// underlying [ChanSrv]'s accept loops and in-flight connections.
+pub struct CfgSrv {
+    srv: ChanSrv,
+    _tasks: tokio::task::JoinSet<()>,
+}
+
+impl std::ops::Deref for CfgSrv {
+    type Target = ChanSrv;
+
+    fn deref(&self) -> &Self::Target {
+        &self.srv
+    }
+}
+
 /// Open the config database and start the config server.
 ///
-/// The returned [ChanSrv] keeps serving until it is dropped.
-pub async fn config_srv(config: &Config) -> Result<ChanSrv> {
+/// The returned [CfgSrv] keeps serving until it is dropped. While it runs, a
+/// background task re-advertises each locally bound address as a
+/// `cfg-addr~<addr>` entry every [`CFG_ADDR_INTERVAL`].
+pub async fn config_srv(config: &Config) -> Result<CfgSrv> {
     let db = Arc::new(
         VmIoDb::new(
             config.db_root_dir.as_str(),
@@ -454,22 +527,38 @@ pub async fn config_srv(config: &Config) -> Result<ChanSrv> {
         Arc::new(CfgGetHandler { db: db.clone() }),
         Arc::new(CfgPutHandler {
             db: db.clone(),
-            counter,
+            counter: counter.clone(),
         }),
     ];
 
+    let bind = if config.addr.is_empty() {
+        // no `--addr` was supplied on the cli, fall back to the wildcard
+        vec![
+            DEFAULT_BIND_ADDR
+                .parse()
+                .expect("valid default bind address"),
+        ]
+    } else {
+        config.addr.clone()
+    };
+
     let srv = ChanSrv::new(ChanSrvConfig {
-        auth_cb: make_auth_cb(db),
+        auth_cb: make_auth_cb(db.clone()),
         handlers,
-        bind: config.addr.clone(),
+        bind,
     })
     .await?;
 
-    for addr in srv.local_addrs() {
+    let local_addrs = srv.local_addrs();
+
+    for addr in &local_addrs {
         tracing::info!("config server listening on {addr}");
     }
 
-    Ok(srv)
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(announce_addrs_task(db, counter, local_addrs));
+
+    Ok(CfgSrv { srv, _tasks: tasks })
 }
 
 /// Run the config server.
@@ -564,5 +653,39 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn announce_addrs_writes_empty_value_with_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = VmIoDb::new(dir.path(), [0x42; 32].into()).await.unwrap();
+        let counter = AtomicI64::new(0);
+
+        let addr: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let before = unix_micros();
+
+        announce_addrs(&db, &counter, &[addr]).await.unwrap();
+
+        let after = unix_micros();
+
+        let entry = db
+            .get(CFG_CLASS.to_string(), format!("{CFG_ADDR_PREFIX}{addr}"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // empty value
+        assert_eq!(Some(Vec::<u8>::new()), entry.metadata);
+
+        // expires one TTL from the time it was written
+        let ttl = CFG_ADDR_TTL.as_micros() as i64;
+        let expires = entry.expires_at_micros.unwrap();
+        assert!(expires >= before + ttl);
+        assert!(expires <= after + ttl);
     }
 }
