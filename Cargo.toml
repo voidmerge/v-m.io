@@ -5,6 +5,7 @@ members = [
   "rs/v-m-io-types",
   "rs/v-m-io-chan",
   "rs/v-m-io-cfg",
+  "rs/v-m-io-cli",
 ]
 resolver = "3"
 

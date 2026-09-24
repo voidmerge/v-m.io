@@ -263,7 +263,9 @@ fn make_auth_cb(db: Arc<VmIoDb>) -> DynAuthCb {
                     Ok(hyper::StatusCode::UNAUTHORIZED)
                 }
                 Err(err) => {
-                    tracing::warn!("authentication error: api key lookup failed: {err}");
+                    tracing::warn!(
+                        "authentication error: api key lookup failed: {err}"
+                    );
                     Ok(hyper::StatusCode::INTERNAL_SERVER_ERROR)
                 }
             }

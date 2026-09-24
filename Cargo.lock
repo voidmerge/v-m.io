@@ -2137,6 +2137,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "v-m-io-cli"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "v-m-io-chan",
+ "v-m-io-types",
+]
+
+[[package]]
 name = "v-m-io-db"
 version = "0.0.1"
 dependencies = [
