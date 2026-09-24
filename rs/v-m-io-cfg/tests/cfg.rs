@@ -53,6 +53,11 @@ async fn client(addr: SocketAddr) -> ChanCli {
         .unwrap()
 }
 
+/// The `(key, value)` entry under which the tests' seeded api key is stored.
+fn api_key_entry() -> (String, String) {
+    (format!("cfg-api-key~{API_KEY}"), String::new())
+}
+
 #[tokio::test]
 async fn put_get_roundtrip_and_overwrite() {
     let dir = tempfile::tempdir().unwrap();
@@ -61,7 +66,10 @@ async fn put_get_roundtrip_and_overwrite() {
     let (_srv, addr) = start(dir.path()).await;
     let cli = client(addr).await;
 
-    assert!(cli.cfg_get(()).await.unwrap().unwrap().is_empty());
+    assert_eq!(
+        vec![api_key_entry()],
+        cli.cfg_get(()).await.unwrap().unwrap(),
+    );
 
     cli.cfg_put(("alpha".into(), "one".into())).await.unwrap();
     cli.cfg_put(("beta".into(), "two".into())).await.unwrap();
@@ -70,6 +78,7 @@ async fn put_get_roundtrip_and_overwrite() {
         vec![
             ("alpha".to_string(), "one".to_string()),
             ("beta".to_string(), "two".to_string()),
+            api_key_entry(),
         ],
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
@@ -82,6 +91,7 @@ async fn put_get_roundtrip_and_overwrite() {
         vec![
             ("alpha".to_string(), "updated".to_string()),
             ("beta".to_string(), "two".to_string()),
+            api_key_entry(),
         ],
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
@@ -102,6 +112,7 @@ async fn empty_and_unicode_values_roundtrip() {
 
     assert_eq!(
         vec![
+            api_key_entry(),
             ("empty".to_string(), "".to_string()),
             ("unicode".to_string(), "héllo → 世界".to_string()),
         ],
@@ -110,7 +121,7 @@ async fn empty_and_unicode_values_roundtrip() {
 }
 
 #[tokio::test]
-async fn api_keys_are_not_returned() {
+async fn api_keys_are_returned() {
     let dir = tempfile::tempdir().unwrap();
 
     let init = serde_json::json!({
@@ -126,7 +137,7 @@ async fn api_keys_are_not_returned() {
     let cli = client(addr).await;
 
     assert_eq!(
-        vec![("public".to_string(), "value".to_string())],
+        vec![api_key_entry(), ("public".to_string(), "value".to_string())],
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
 }
@@ -162,8 +173,15 @@ async fn pushed_api_key_can_authenticate() {
         .await
         .unwrap();
 
-    // the newly pushed api key is not exposed by the getter
-    assert!(cli2.cfg_get(()).await.unwrap().unwrap().is_empty());
+    // the newly pushed api key is exposed by the getter alongside the seeded
+    // one, both with empty values
+    assert_eq!(
+        vec![
+            ("cfg-api-key~second".to_string(), String::new()),
+            api_key_entry(),
+        ],
+        cli2.cfg_get(()).await.unwrap().unwrap(),
+    );
 }
 
 #[tokio::test]
@@ -186,7 +204,7 @@ async fn values_persist_across_restart() {
     let cli = client(addr).await;
 
     assert_eq!(
-        vec![("persisted".to_string(), "yes".to_string())],
+        vec![api_key_entry(), ("persisted".to_string(), "yes".to_string())],
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
 }
@@ -218,7 +236,7 @@ async fn init_overwrites_existing_values() {
     let cli = client(addr).await;
 
     assert_eq!(
-        vec![("k".to_string(), "new".to_string())],
+        vec![api_key_entry(), ("k".to_string(), "new".to_string())],
         cli.cfg_get(()).await.unwrap().unwrap(),
     );
 }
@@ -236,7 +254,10 @@ async fn oversized_value_is_rejected() {
     assert!(cli.cfg_put(("big".into(), big)).await.is_err());
 
     // the rejected write must not have landed
-    assert!(cli.cfg_get(()).await.unwrap().unwrap().is_empty());
+    assert_eq!(
+        vec![api_key_entry()],
+        cli.cfg_get(()).await.unwrap().unwrap(),
+    );
 }
 
 #[tokio::test]
