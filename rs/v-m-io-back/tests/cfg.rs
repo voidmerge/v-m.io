@@ -63,7 +63,8 @@ async fn cfg_get_config(cli: &ChanCli) -> Vec<(String, String)> {
         .unwrap()
         .unwrap()
         .into_iter()
-        .filter(|(k, _)| !k.starts_with("cfg-addr~"))
+        .filter(|item| !item.key.starts_with("cfg-addr~"))
+        .map(|item| (item.key, item.value))
         .collect()
 }
 
@@ -72,12 +73,14 @@ fn api_key_entry() -> (String, String) {
     (format!("cfg-api-key~{API_KEY}"), String::new())
 }
 
-/// Build a `cfg-put` request with no expiration.
+/// Build a `cfg-put` request with no expiration and a server-assigned
+/// last-modified time.
 fn put(key: &str, value: impl Into<String>) -> CfgPutReq {
     CfgPutReq {
         key: key.to_string(),
         value: value.into(),
         expires_at_micros: None,
+        modified_at_micros: None,
     }
 }
 
@@ -154,6 +157,7 @@ async fn put_with_future_expiry_is_returned() {
         key: "session".into(),
         value: "token".into(),
         expires_at_micros: Some(expires_at_micros),
+        modified_at_micros: None,
     })
     .await
     .unwrap();
@@ -165,6 +169,100 @@ async fn put_with_future_expiry_is_returned() {
         ],
         cfg_get_config(&cli).await,
     );
+
+    // the entry's metadata is returned alongside its value, so the response
+    // can drive config synchronization between nodes
+    let session = cli
+        .cfg_get(())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.key == "session")
+        .unwrap();
+
+    assert_eq!(Some(expires_at_micros), session.expires_at_micros);
+    assert!(session.modified_at_micros > 0);
+}
+
+#[tokio::test]
+async fn get_returns_strictly_increasing_modified_at_micros() {
+    let dir = tempfile::tempdir().unwrap();
+    init_api_key(dir.path()).await;
+
+    let (_srv, addr) = start(dir.path()).await;
+    let cli = client(addr).await;
+
+    cli.cfg_put(put("a", "1")).await.unwrap();
+    cli.cfg_put(put("b", "2")).await.unwrap();
+    cli.cfg_put(put("a", "3")).await.unwrap();
+
+    let items = cli.cfg_get(()).await.unwrap().unwrap();
+
+    let modified = |key: &str| {
+        items
+            .iter()
+            .find(|item| item.key == key)
+            .unwrap()
+            .modified_at_micros
+    };
+
+    // every write gets its own timestamp, and rewriting a key moves it
+    // forward rather than reusing the original
+    assert!(modified("a") > modified("b"));
+    assert!(modified("b") > 0);
+}
+
+#[tokio::test]
+async fn put_with_explicit_modified_at_micros_is_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    init_api_key(dir.path()).await;
+
+    let (_srv, addr) = start(dir.path()).await;
+    let cli = client(addr).await;
+
+    // a value far in the future so it is unambiguous against server time, as
+    // if applied from a peer whose clock runs ahead
+    let explicit = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+        + 60_000_000_000;
+
+    cli.cfg_put(CfgPutReq {
+        key: "synced".into(),
+        value: "from-peer".into(),
+        expires_at_micros: None,
+        modified_at_micros: Some(explicit),
+    })
+    .await
+    .unwrap();
+
+    let synced = cli
+        .cfg_get(())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.key == "synced")
+        .unwrap();
+
+    assert_eq!(explicit, synced.modified_at_micros);
+
+    // an explicit timestamp pushes the server's clock ahead of it, so a
+    // subsequent server-assigned write is ordered after the synced entry
+    cli.cfg_put(put("local", "now")).await.unwrap();
+
+    let local = cli
+        .cfg_get(())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.key == "local")
+        .unwrap();
+
+    assert!(local.modified_at_micros > explicit);
 }
 
 #[tokio::test]
@@ -445,7 +543,8 @@ async fn bound_addr_is_advertised() {
     let mut found = false;
     for _ in 0..200 {
         let cfg = cli.cfg_get(()).await.unwrap().unwrap();
-        if cfg.iter().any(|(k, v)| *k == expected && v.is_empty()) {
+        if cfg.iter().any(|item| item.key == expected && item.value.is_empty())
+        {
             found = true;
             break;
         }

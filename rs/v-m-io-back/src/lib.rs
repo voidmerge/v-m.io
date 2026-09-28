@@ -10,7 +10,7 @@ use v_m_io_chan::{
     BoxFut, ChanHandler, ChanSrv, ChanSrvConfig, DynAuthCb, DynChanHandler,
 };
 use v_m_io_db::{VmIoDb, VmIoDbListFilter, VmIoDbListSort};
-use v_m_io_types::api::{CfgGetRes, CfgPutReq, decode, encode};
+use v_m_io_types::api::{CfgGetItem, CfgGetRes, CfgPutReq, decode, encode};
 
 /// Configure how to run the backend server.
 #[derive(Debug, clap::Parser)]
@@ -244,12 +244,20 @@ impl Config {
     }
 }
 
-/// Upsert a single config value, retrying on a timestamp collision.
+/// Upsert a single config value.
+///
+/// An explicit `modified_at_micros` is authoritative and used exactly as
+/// given, so syncing an entry from a peer preserves the peer's ordering. It
+/// is not retried on a timestamp collision, since silently adjusting it would
+/// defeat that purpose. When `modified_at_micros` is `None`, a fresh "now" is
+/// allocated from the shared counter, retrying on the (expected) unique
+/// `modified_at_micros` constraint.
 async fn upsert_value(
     db: &VmIoDb,
     counter: &AtomicI64,
     key: String,
     value: String,
+    modified_at_micros: Option<i64>,
     expires_at_micros: Option<i64>,
 ) -> Result<()> {
     if key.len() > CFG_KEY_MAX {
@@ -266,6 +274,22 @@ async fn upsert_value(
             std::io::ErrorKind::InvalidInput,
             "config value cannot be > 4096 bytes",
         ));
+    }
+
+    if let Some(modified_at_micros) = modified_at_micros {
+        // keep the counter ahead of any explicitly applied timestamp so
+        // subsequent server-generated "now" values cannot collide with it
+        counter.fetch_max(modified_at_micros, Ordering::SeqCst);
+
+        return db
+            .upsert(
+                CFG_CLASS.to_string(),
+                key,
+                modified_at_micros,
+                expires_at_micros,
+                Some(metadata),
+            )
+            .await;
     }
 
     let mut last_err = None;
@@ -310,6 +334,7 @@ async fn announce_addrs(
             counter,
             format!("{CFG_ADDR_PREFIX}{addr}"),
             String::new(),
+            None,
             Some(expires_at_micros),
         )
         .await?;
@@ -335,10 +360,12 @@ async fn announce_addrs_task(
     }
 }
 
-/// Read every regular config value, excluding api keys.
+/// Read every config value, including api keys and address advertisements.
 ///
-/// Values are returned sorted by key ascending.
-async fn read_all(db: &VmIoDb) -> Result<Vec<(String, String)>> {
+/// Each entry carries its `modified_at_micros` and `expires_at_micros` so the
+/// response can drive config synchronization between backend nodes. Entries
+/// are returned sorted by key ascending.
+async fn read_all(db: &VmIoDb) -> Result<Vec<CfgGetItem>> {
     let entries = db
         .list(
             CFG_CLASS.to_string(),
@@ -358,7 +385,12 @@ async fn read_all(db: &VmIoDb) -> Result<Vec<(String, String)>> {
             None => String::new(),
         };
 
-        out.push((entry.key, value));
+        out.push(CfgGetItem {
+            key: entry.key,
+            value,
+            modified_at_micros: entry.modified_at_micros,
+            expires_at_micros: entry.expires_at_micros,
+        });
     }
 
     Ok(out)
@@ -403,6 +435,7 @@ impl ChanHandler for CfgPutHandler {
                 key,
                 value,
                 expires_at_micros,
+                modified_at_micros,
             } = decode(&req)?;
 
             // api keys may be pushed through the same interface as any other
@@ -412,6 +445,7 @@ impl ChanHandler for CfgPutHandler {
                 &self.counter,
                 key,
                 value,
+                modified_at_micros,
                 expires_at_micros,
             )
             .await?;
@@ -484,7 +518,7 @@ pub async fn config_init(config: &Config) -> Result<()> {
 
     // init values never expire; expiries can only be set through `cfg-put`
     for (key, value) in values {
-        upsert_value(&db, &counter, key, value, None).await?;
+        upsert_value(&db, &counter, key, value, None, None).await?;
     }
 
     Ok(())
