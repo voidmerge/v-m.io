@@ -3,18 +3,27 @@ name = "v-m-io-back"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
-description = "v-m.io types"
+description = "v-m.io backend cluster server"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-documentation = "https://docs.rs/v-m-io-types"
+documentation = "https://docs.rs/v-m-io-back"
 repository = "https://github.com/voidmerge/v-m.io"
 keywords = [ "p2p", "verify", "verifiable" ]
 categories = [ "database", "database-implementations", "network-programming", "web-programming" ]
 
 [dependencies]
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive", "env", "wrap_help"] }
+hyper = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
-hyper = { workspace = true, features = ["server"] }
-hyper-util = { workspace = true, features = ["server", "server-auto", "tokio"] }
-http-body-util = { workspace = true }
-lru = { workspace = true }
-mlua = { workspace = true, features = ["luajit"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+v-m-io-chan = { workspace = true }
+v-m-io-db = { workspace = true }
+v-m-io-types = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }

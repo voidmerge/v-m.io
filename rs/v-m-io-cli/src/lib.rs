@@ -67,13 +67,15 @@ pub async fn client_run(config: Config) -> Result<()> {
         Cmd::Health => health(config).await,
         Cmd::CfgGet { show_tombstones } => {
             let cfg = cfg_get(config).await?.map_err(std::io::Error::other)?;
-            let cfg: std::collections::BTreeMap<String, String> =
-                cfg.into_iter().filter(|(_k, v)| {
+            let cfg: std::collections::BTreeMap<String, String> = cfg
+                .into_iter()
+                .filter(|(_k, v)| {
                     if show_tombstones {
                         return true;
                     }
                     v != v_m_io_types::api::CONFIG_TOMBSTONE
-                }).collect();
+                })
+                .collect();
             println!("{}", serde_json::to_string_pretty(&cfg)?);
             Ok(())
         }

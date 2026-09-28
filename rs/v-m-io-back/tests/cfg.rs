@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use base64::Engine;
-use v_m_io_cfg::{CfgSrv, Config, config_init, config_srv};
+use v_m_io_back::{BackSrv, Config, back_srv, config_init};
 use v_m_io_chan::ChanCli;
 use v_m_io_chan::cfg::ChanCliCfgExt;
 use v_m_io_types::api::CfgPutReq;
@@ -41,9 +41,9 @@ async fn init_api_key(dir: &Path) {
 }
 
 /// Start a config server on an ephemeral port.
-async fn start(dir: &Path) -> (CfgSrv, SocketAddr) {
+async fn start(dir: &Path) -> (BackSrv, SocketAddr) {
     let cfg = config(dir, None);
-    let srv = config_srv(&cfg).await.unwrap();
+    let srv = back_srv(&cfg).await.unwrap();
     let addr = srv.local_addrs()[0];
     (srv, addr)
 }
@@ -347,7 +347,7 @@ async fn test_defaults_seed_api_key_and_bind() {
     cfg.init = None;
     cfg.addr = vec!["127.0.0.1:0".parse().unwrap()];
 
-    let srv = config_srv(&cfg).await.unwrap();
+    let srv = back_srv(&cfg).await.unwrap();
     let addr = srv.local_addrs()[0];
     let cli = ChanCli::connect(addr, "Bearer test".to_string())
         .await
@@ -380,7 +380,7 @@ async fn test_defaults_preserve_explicit_addr_and_init() {
     cfg.init = None;
     cfg.addr = vec!["127.0.0.1:0".parse().unwrap()];
 
-    let srv = config_srv(&cfg).await.unwrap();
+    let srv = back_srv(&cfg).await.unwrap();
     let addr = srv.local_addrs()[0];
     let cli = ChanCli::connect(addr, "Bearer test".to_string())
         .await

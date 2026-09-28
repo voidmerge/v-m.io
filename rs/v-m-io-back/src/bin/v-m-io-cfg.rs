@@ -1,5 +1,5 @@
 use tracing_subscriber::EnvFilter;
-use v_m_io_cfg::{Config, config_run};
+use v_m_io_back::{Config, back_run};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::io::Result<()> {
@@ -15,5 +15,5 @@ async fn main() -> std::io::Result<()> {
         .map_err(std::io::Error::other)?;
 
     let config = Config::parse();
-    config_run(config).await
+    back_run(config).await
 }
