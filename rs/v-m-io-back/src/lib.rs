@@ -23,7 +23,7 @@ pub struct Config {
     /// Comma-separated list of local addresses to which we should bind the
     /// server.
     ///
-    /// If not specified, defaults to `0.0.0.0:0`, or `127.0.0.1:44332` when
+    /// If not specified, defaults to `0.0.0.0:22002`, or `127.0.0.1:22002` when
     /// `--test` is set.
     #[arg(
         long,
@@ -94,10 +94,10 @@ const CFG_PUT_REQ: &str = "cfg-put";
 
 /// The default `--addr` value, used to detect whether the caller explicitly
 /// supplied a bind address.
-const DEFAULT_BIND_ADDR: &str = "0.0.0.0:0";
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:22002";
 
 /// The bind address used in `--test` mode when no explicit `--addr` is given.
-const TEST_BIND_ADDR: &str = "127.0.0.1:44332";
+const TEST_BIND_ADDR: &str = "127.0.0.1:22002";
 
 /// The api key seeded into the kv store in `--test` mode.
 const TEST_API_KEY: &str = "test";

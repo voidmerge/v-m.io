@@ -12,7 +12,7 @@ use v_m_io_types::api::CfgPutReq;
 #[command(version, about, long_about = None)]
 pub struct Config {
     /// V-m.io server address.
-    #[arg(long, env = "V_M_IO_ADDR", default_value = "127.0.0.1:44332")]
+    #[arg(long, env = "V_M_IO_ADDR", default_value = "127.0.0.1:22002")]
     pub addr: std::net::SocketAddr,
 
     /// Api token allowing access.

@@ -435,7 +435,7 @@ async fn test_defaults_seed_api_key_and_bind() {
     cfg.apply_test_defaults(dir.path().to_path_buf()).unwrap();
 
     assert_eq!(cfg.db_root_dir, dir.path().to_string_lossy());
-    assert_eq!(cfg.addr, vec!["127.0.0.1:44332".parse().unwrap()]);
+    assert_eq!(cfg.addr, vec!["127.0.0.1:22002".parse().unwrap()]);
 
     // the test encryption key default allows initialization without an
     // explicit --encryption-key
