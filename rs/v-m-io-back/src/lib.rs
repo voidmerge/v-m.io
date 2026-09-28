@@ -252,6 +252,10 @@ impl Config {
 /// defeat that purpose. When `modified_at_micros` is `None`, a fresh "now" is
 /// allocated from the shared counter, retrying on the (expected) unique
 /// `modified_at_micros` constraint.
+///
+/// A write whose timestamp is not strictly newer than the stored entry is
+/// superseded by the database and left as a no-op; that is logged and treated
+/// as success (newer wins).
 async fn upsert_value(
     db: &VmIoDb,
     counter: &AtomicI64,
@@ -281,15 +285,24 @@ async fn upsert_value(
         // subsequent server-generated "now" values cannot collide with it
         counter.fetch_max(modified_at_micros, Ordering::SeqCst);
 
-        return db
+        let applied = db
             .upsert(
                 CFG_CLASS.to_string(),
-                key,
+                key.clone(),
                 modified_at_micros,
                 expires_at_micros,
                 Some(metadata),
             )
-            .await;
+            .await?;
+
+        if !applied {
+            tracing::debug!(
+                "config write superseded by a newer entry: {key} @ \
+                 {modified_at_micros}",
+            );
+        }
+
+        return Ok(());
     }
 
     let mut last_err = None;
@@ -308,7 +321,15 @@ async fn upsert_value(
             )
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(applied) => {
+                if !applied {
+                    tracing::debug!(
+                        "config write superseded by a newer entry: {key} @ \
+                         {modified_at_micros}",
+                    );
+                }
+                return Ok(());
+            }
             Err(err) => last_err = Some(err),
         }
     }

@@ -267,6 +267,10 @@ impl VmIoDb {
     }
 
     /// Upsert an entry.
+    ///
+    /// Returns `true` if the write was applied, or `false` if the entry was
+    /// left untouched because its existing `modified_at_micros` is greater
+    /// than or equal to this one's.
     pub async fn upsert(
         &self,
         class: String,
@@ -274,7 +278,7 @@ impl VmIoDb {
         modified_at_micros: i64,
         expires_at_micros: Option<i64>,
         metadata: Option<Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if class.len() > 256 {
             return Err(std::io::Error::other("class cannot be > 256 bytes"));
         }
@@ -510,6 +514,72 @@ mod tests {
         assert_eq!("hello", String::from_utf8_lossy(&c));
 
         db.rm("c".into(), "k".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upsert_only_applies_when_strictly_newer() {
+        let (db, _dir) = make_db().await.unwrap();
+
+        // a new key always inserts
+        assert!(
+            db.upsert("c".into(), "k".into(), 10, None, Some(b"v1".to_vec()))
+                .await
+                .unwrap()
+        );
+
+        // a strictly greater timestamp applies, replacing value and expiry
+        assert!(
+            db.upsert(
+                "c".into(),
+                "k".into(),
+                20,
+                Some(123),
+                Some(b"v2".to_vec()),
+            )
+            .await
+            .unwrap()
+        );
+
+        let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
+        assert_eq!(20, e.modified_at_micros);
+        assert_eq!(Some(123), e.expires_at_micros);
+        assert_eq!(Some(b"v2".to_vec()), e.metadata);
+
+        // an equal timestamp is superseded and changes nothing
+        assert!(
+            !db.upsert(
+                "c".into(),
+                "k".into(),
+                20,
+                None,
+                Some(b"v3".to_vec()),
+            )
+            .await
+            .unwrap()
+        );
+
+        let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
+        assert_eq!(20, e.modified_at_micros);
+        assert_eq!(Some(123), e.expires_at_micros);
+        assert_eq!(Some(b"v2".to_vec()), e.metadata);
+
+        // a lesser timestamp is likewise superseded
+        assert!(
+            !db.upsert(
+                "c".into(),
+                "k".into(),
+                5,
+                Some(999),
+                Some(b"v4".to_vec()),
+            )
+            .await
+            .unwrap()
+        );
+
+        let e = db.get("c".into(), "k".into()).await.unwrap().unwrap();
+        assert_eq!(20, e.modified_at_micros);
+        assert_eq!(Some(123), e.expires_at_micros);
+        assert_eq!(Some(b"v2".to_vec()), e.metadata);
     }
 
     #[tokio::test]

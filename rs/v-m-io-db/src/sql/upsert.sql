@@ -16,3 +16,6 @@ ON CONFLICT(class, key) DO UPDATE SET
   modified_at_micros = excluded.modified_at_micros,
   expires_at_micros = excluded.expires_at_micros,
   metadata          = excluded.metadata
+-- only a strictly newer write may replace an existing entry; a stale or
+-- equal write is a no-op so concurrent writers converge on the newest version
+WHERE excluded.modified_at_micros > entries.modified_at_micros

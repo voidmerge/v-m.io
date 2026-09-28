@@ -154,6 +154,10 @@ impl Sql {
     }
 
     /// Upsert an entry.
+    ///
+    /// Returns `true` if the write was applied, or `false` if it was
+    /// superseded by an existing entry whose `modified_at_micros` is greater
+    /// than or equal to this one's.
     pub async fn upsert(
         &self,
         class: String,
@@ -161,10 +165,10 @@ impl Sql {
         modified_at_micros: i64,
         expires_at_micros: Option<i64>,
         metadata: Option<Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let c_write = self.c_write.clone();
         tokio::task::spawn_blocking(move || {
-            c_write
+            let changed = c_write
                 .lock()
                 .unwrap()
                 .execute(
@@ -178,7 +182,7 @@ impl Sql {
                     ],
                 )
                 .map_err(std::io::Error::other)?;
-            Ok(())
+            Ok(changed > 0)
         })
         .await
         .expect("blocking thread error")
